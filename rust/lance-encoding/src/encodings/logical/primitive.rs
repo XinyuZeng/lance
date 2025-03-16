@@ -1656,6 +1656,10 @@ impl AccumulationQueue {
         }
     }
 
+    pub fn current_bytes(&self) -> u64 {
+        self.current_bytes
+    }
+
     /// Adds an array to the queue, if there is enough data then the queue is flushed
     /// and returned
     pub fn insert(&mut self, array: ArrayRef, row_number: u64) -> Option<(Vec<ArrayRef>, u64)> {
@@ -1802,6 +1806,10 @@ impl PrimitiveFieldEncoder {
 }
 
 impl FieldEncoder for PrimitiveFieldEncoder {
+    fn current_bytes(&self) -> u64 {
+        self.accumulation_queue.current_bytes()
+    }
+
     // Buffers data, if there is enough to write a page then we create an encode task
     fn maybe_encode(
         &mut self,

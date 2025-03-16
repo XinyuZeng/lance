@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use core::panic;
+use std::cmp::max;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -101,6 +102,7 @@ pub struct FileWriter {
     global_buffers: Vec<(u64, u64)>,
     schema_metadata: HashMap<String, String>,
     options: FileWriterOptions,
+    max_mem_bytes: u64,
 }
 
 fn initial_column_metadata() -> pbfile::ColumnMetadata {
@@ -113,6 +115,10 @@ fn initial_column_metadata() -> pbfile::ColumnMetadata {
 }
 
 impl FileWriter {
+    pub fn max_mem_bytes(&self) -> u64 {
+        self.max_mem_bytes
+    }
+
     /// Create a new FileWriter with a desired output schema
     pub fn try_new(
         object_writer: ObjectWriter,
@@ -140,6 +146,7 @@ impl FileWriter {
             global_buffers: Vec::new(),
             schema_metadata: HashMap::new(),
             options,
+            max_mem_bytes: 0,
         }
     }
 
@@ -291,7 +298,9 @@ impl FileWriter {
         batch: &RecordBatch,
         external_buffers: &mut OutOfLineBuffers,
     ) -> Result<Vec<Vec<EncodeTask>>> {
-        self.schema
+        let mut max_cur = 0;
+        let res = self
+            .schema
             .as_ref()
             .unwrap()
             .fields
@@ -309,14 +318,18 @@ impl FileWriter {
                         location: location!(),
                     })?;
                 let repdef = RepDefBuilder::default();
-                column_writer.maybe_encode(
+                let res = column_writer.maybe_encode(
                     array.clone(),
                     external_buffers,
                     repdef,
                     self.rows_written,
-                )
+                );
+                max_cur += column_writer.current_bytes();
+                res
             })
-            .collect::<Result<Vec<_>>>()
+            .collect::<Result<Vec<_>>>();
+        self.max_mem_bytes = max(self.max_mem_bytes, max_cur);
+        res
     }
 
     /// Schedule a batch of data to be written to the file
@@ -731,6 +744,35 @@ mod tests {
 
         for batch in reader {
             file_writer.write_batch(&batch.unwrap()).await.unwrap();
+        }
+        file_writer.add_schema_metadata("foo", "bar");
+        file_writer.finish().await.unwrap();
+        // Tests asserting the contents of the written file are in reader.rs
+    }
+
+    #[tokio::test]
+    async fn test_basic_write_large() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let tmp_path: String = tmp_dir.path().to_str().unwrap().to_owned();
+        let tmp_path = Path::parse(tmp_path).unwrap();
+        let tmp_path = tmp_path.child("some_file.lance");
+        let obj_store = Arc::new(ObjectStore::local());
+
+        let reader = gen()
+            .col("score", array::rand_utf8(16.into(), false))
+            .into_reader_rows(RowCount::from(65536), BatchCount::from(20));
+
+        let writer = obj_store.create(&tmp_path).await.unwrap();
+
+        let lance_schema =
+            lance_core::datatypes::Schema::try_from(reader.schema().as_ref()).unwrap();
+
+        let mut file_writer =
+            FileWriter::try_new(writer, lance_schema, FileWriterOptions::default()).unwrap();
+
+        for batch in reader {
+            file_writer.write_batch(&batch.unwrap()).await.unwrap();
+            println!("{}", file_writer.max_mem_bytes());
         }
         file_writer.add_schema_metadata("foo", "bar");
         file_writer.finish().await.unwrap();

@@ -398,6 +398,10 @@ pub trait FieldEncoder: Send {
 
     /// The number of output columns this encoding will create
     fn num_columns(&self) -> u32;
+
+    fn current_bytes(&self) -> u64 {
+        unimplemented!("current bytes")
+    }
 }
 
 /// A trait to pick which encoding strategy to use for a single page
