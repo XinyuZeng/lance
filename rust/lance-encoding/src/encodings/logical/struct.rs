@@ -907,6 +907,9 @@ impl StructFieldEncoder {
 }
 
 impl FieldEncoder for StructFieldEncoder {
+    fn current_bytes(&self) -> u64 {
+        self.children.iter().map(|c| c.current_bytes()).sum()
+    }
     fn maybe_encode(
         &mut self,
         array: ArrayRef,

@@ -1170,6 +1170,9 @@ impl ListFieldEncoder {
 }
 
 impl FieldEncoder for ListFieldEncoder {
+    fn current_bytes(&self) -> u64 {
+        self.offsets_encoder.accumulation_queue.current_bytes() + self.items_encoder.current_bytes()
+    }
     fn maybe_encode(
         &mut self,
         array: ArrayRef,
