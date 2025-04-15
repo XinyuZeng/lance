@@ -11,13 +11,13 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package com.lancedb.lance.spark;
 
 import org.apache.spark.sql.util.CaseInsensitiveStringMap;
 
 import java.io.Serializable;
 import java.util.Map;
+import java.util.Objects;
 
 /** Lance Configuration. */
 public class LanceConfig implements Serializable {
@@ -117,5 +117,21 @@ public class LanceConfig implements Serializable {
 
   public Map<String, String> getOptions() {
     return options;
+  }
+
+  @Override
+  public boolean equals(Object o) {
+    if (o == null || getClass() != o.getClass()) return false;
+    LanceConfig config = (LanceConfig) o;
+    return pushDownFilters == config.pushDownFilters
+        && Objects.equals(dbPath, config.dbPath)
+        && Objects.equals(datasetName, config.datasetName)
+        && Objects.equals(datasetUri, config.datasetUri)
+        && Objects.equals(options, config.options);
+  }
+
+  @Override
+  public int hashCode() {
+    return Objects.hash(dbPath, datasetName, datasetUri, pushDownFilters, options);
   }
 }

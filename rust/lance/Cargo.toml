@@ -39,7 +39,7 @@ bytes.workspace = true
 chrono.workspace = true
 clap = { version = "4.1.1", features = ["derive"], optional = true }
 # This is already used by datafusion
-dashmap = "5"
+dashmap = "6"
 deepsize.workspace = true
 # matches arrow-rs use
 half.workspace = true
@@ -82,9 +82,6 @@ pprof.workspace = true
 # Need this so we can prevent dynamic linking in binaries (see cli feature)
 lzma-sys = { version = "0.1" }
 
-[build-dependencies]
-prost-build.workspace = true
-
 [dev-dependencies]
 lance-test-macros = { workspace = true }
 lance-datagen = { workspace = true }
@@ -97,10 +94,13 @@ all_asserts = "2.3.1"
 mock_instant.workspace = true
 lance-testing = { workspace = true }
 tracing-subscriber = { version = "0.3.17", features = ["env-filter"] }
-env_logger = "0.10.0"
+env_logger = "0.11.7"
 tracing-chrome = "0.7.1"
 rstest = { workspace = true }
 random_word = { version = "0.4.3", features = ["en"] }
+# For S3 / DynamoDB tests
+aws-config = { workspace = true }
+aws-sdk-s3 = { workspace = true }
 
 
 [features]
@@ -111,6 +111,12 @@ tensorflow = ["tfrecord", "prost_old"]
 dynamodb = ["lance-table/dynamodb", "aws-sdk-dynamodb"]
 dynamodb_tests = ["dynamodb"]
 substrait = ["lance-datafusion/substrait"]
+protoc = [
+    "lance-encoding/protoc",
+    "lance-file/protoc",
+    "lance-index/protoc",
+    "lance-table/protoc",
+]
 
 [[bin]]
 name = "lq"

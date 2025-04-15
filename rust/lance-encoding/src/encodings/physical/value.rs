@@ -6,14 +6,15 @@ use arrow_schema::DataType;
 use bytes::Bytes;
 use futures::{future::BoxFuture, FutureExt};
 use log::trace;
-use snafu::{location, Location};
+use snafu::location;
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
 use crate::buffer::LanceBuffer;
-use crate::data::{BlockInfo, ConstantDataBlock, DataBlock, FixedWidthDataBlock};
-use crate::decoder::PerValueDecompressor;
-use crate::decoder::{BlockDecompressor, MiniBlockDecompressor};
+use crate::data::{
+    BlockInfo, ConstantDataBlock, DataBlock, FixedSizeListBlock, FixedWidthDataBlock,
+};
+use crate::decoder::{BlockDecompressor, FixedPerValueDecompressor, MiniBlockDecompressor};
 use crate::encoder::{
     BlockCompressor, MiniBlockChunk, MiniBlockCompressed, MiniBlockCompressor, PerValueCompressor,
     PerValueDataBlock, MAX_MINIBLOCK_BYTES, MAX_MINIBLOCK_VALUES,
@@ -287,6 +288,17 @@ impl ValueEncoder {
             num_values: data.num_values,
         }
     }
+
+    fn make_fsl_encoding(data: &FixedSizeListBlock) -> ArrayEncoding {
+        let inner_encoding = match data.child.as_ref() {
+            DataBlock::FixedWidth(fixed_width) => {
+                ProtobufUtils::flat_encoding(fixed_width.bits_per_value, 0, None)
+            }
+            DataBlock::FixedSizeList(fsl) => Self::make_fsl_encoding(fsl),
+            _ => unreachable!(),
+        };
+        ProtobufUtils::fixed_size_list(inner_encoding, data.dimension)
+    }
 }
 
 impl BlockCompressor for ValueEncoder {
@@ -344,6 +356,11 @@ impl MiniBlockCompressor for ValueEncoder {
                 let encoding = ProtobufUtils::flat_encoding(fixed_width.bits_per_value, 0, None);
                 Ok((Self::chunk_data(fixed_width), encoding))
             }
+            DataBlock::FixedSizeList(mut fixed_size_list) => {
+                let flattened = fixed_size_list.flatten_as_fixed();
+                let encoding = Self::make_fsl_encoding(&fixed_size_list);
+                Ok((Self::chunk_data(flattened), encoding))
+            }
             _ => Err(Error::InvalidInput {
                 source: format!(
                     "Cannot compress a data block of type {} with ValueEncoder",
@@ -395,37 +412,33 @@ impl ValueDecompressor {
             bytes_per_value: description.bits_per_value / 8,
         }
     }
+
+    fn buffer_to_block(&self, data: LanceBuffer) -> DataBlock {
+        DataBlock::FixedWidth(FixedWidthDataBlock {
+            bits_per_value: self.bytes_per_value * 8,
+            num_values: data.len() as u64 / self.bytes_per_value,
+            data,
+            block_info: BlockInfo::new(),
+        })
+    }
 }
 
 impl BlockDecompressor for ValueDecompressor {
     fn decompress(&self, data: LanceBuffer) -> Result<DataBlock> {
-        let num_values = data.len() as u64 / self.bytes_per_value;
-        assert_eq!(data.len() as u64 % self.bytes_per_value, 0);
-        Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
-            bits_per_value: self.bytes_per_value * 8,
-            data,
-            num_values,
-            block_info: BlockInfo::new(),
-        }))
+        Ok(self.buffer_to_block(data))
     }
 }
 
 impl MiniBlockDecompressor for ValueDecompressor {
     fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock> {
-        debug_assert!(data.len() as u64 >= num_values * self.bytes_per_value);
-
-        Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
-            data,
-            bits_per_value: self.bytes_per_value * 8,
-            num_values,
-            block_info: BlockInfo::new(),
-        }))
+        assert_eq!(data.len() as u64, num_values * self.bytes_per_value);
+        Ok(self.buffer_to_block(data))
     }
 }
 
-impl PerValueDecompressor for ValueDecompressor {
-    fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock> {
-        MiniBlockDecompressor::decompress(self, data, num_values)
+impl FixedPerValueDecompressor for ValueDecompressor {
+    fn decompress(&self, data: FixedWidthDataBlock) -> Result<DataBlock> {
+        Ok(DataBlock::FixedWidth(data))
     }
 
     fn bits_per_value(&self) -> u64 {

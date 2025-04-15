@@ -11,12 +11,9 @@
 //!
 //! The trait [CommitHandler] can be implemented to provide different commit
 //! strategies. The default implementation for most object stores is
-//! [RenameCommitHandler], which writes the manifest to a temporary path, then
+//! [ConditionalPutCommitHandler], which writes the manifest to a temporary path, then
 //! renames the temporary path to the final path if no object already exists
-//! at the final path. This is an atomic operation in most object stores, but
-//! not in AWS S3. So for AWS S3, the default commit handler is
-//! [UnsafeCommitHandler], which writes the manifest to the final path without
-//! any checks.
+//! at the final path.
 //!
 //! When providing your own commit handler, most often you are implementing in
 //! terms of a lock. The trait [CommitLock] can be implemented as a simpler
@@ -26,6 +23,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use lance_file::version::LanceFileVersion;
+use lance_index::metrics::NoOpMetricsCollector;
 use lance_table::format::{
     is_detached_version, pb, DataStorageFormat, DeletionFile, Fragment, Index, Manifest,
     WriterVersion, DETACHED_VERSION_MASK,
@@ -33,7 +31,7 @@ use lance_table::format::{
 use lance_table::io::commit::{CommitConfig, CommitError, CommitHandler, ManifestNamingScheme};
 use lance_table::io::deletion::read_deletion_file;
 use rand::{thread_rng, Rng};
-use snafu::{location, Location};
+use snafu::location;
 
 use futures::future::Either;
 use futures::{FutureExt, StreamExt, TryStreamExt};
@@ -50,10 +48,12 @@ use crate::index::DatasetIndexInternalExt;
 use crate::session::Session;
 use crate::Dataset;
 
-#[cfg(all(feature = "dynamodb", test))]
+#[cfg(all(feature = "dynamodb_tests", test))]
 mod dynamodb;
 #[cfg(test)]
 mod external_manifest;
+#[cfg(all(feature = "dynamodb_tests", test))]
+mod s3_test;
 
 /// Read the transaction data from a transaction file.
 async fn read_transaction_file(
@@ -163,7 +163,7 @@ async fn do_commit_new_dataset(
     manifest_naming_scheme: ManifestNamingScheme,
     blob_version: Option<u64>,
     session: &Session,
-) -> Result<(Manifest, Path)> {
+) -> Result<(Manifest, Path, Option<String>)> {
     let transaction_file = write_transaction_file(object_store, base_path, transaction).await?;
 
     let (mut manifest, indices) =
@@ -189,12 +189,12 @@ async fn do_commit_new_dataset(
     // TODO: Allow Append or Overwrite mode to retry using `commit_transaction`
     // if there is a conflict.
     match result {
-        Ok(manifest_path) => {
+        Ok(manifest_location) => {
             session.file_metadata_cache.insert(
                 transaction_file_cache_path(base_path, manifest.version),
                 Arc::new(transaction.clone()),
             );
-            Ok((manifest, manifest_path))
+            Ok((manifest, manifest_location.path, manifest_location.e_tag))
         }
         Err(CommitError::CommitConflict) => Err(crate::Error::DatasetAlreadyExists {
             uri: base_path.to_string(),
@@ -212,11 +212,11 @@ pub(crate) async fn commit_new_dataset(
     write_config: &ManifestWriteConfig,
     manifest_naming_scheme: ManifestNamingScheme,
     session: &Session,
-) -> Result<(Manifest, Path)> {
+) -> Result<(Manifest, Path, Option<String>)> {
     let blob_version = if let Some(blob_op) = transaction.blobs_op.as_ref() {
         let blob_path = base_path.child(BLOB_DIR);
         let blob_tx = Transaction::new(0, blob_op.clone(), None, None);
-        let (blob_manifest, _) = do_commit_new_dataset(
+        let (blob_manifest, _, _) = do_commit_new_dataset(
             object_store,
             commit_handler,
             &blob_path,
@@ -497,13 +497,25 @@ fn must_recalculate_fragment_bitmap(index: &Index, version: Option<&WriterVersio
 ///
 /// Indices might be missing `fragment_bitmap`, so this function will add it.
 async fn migrate_indices(dataset: &Dataset, indices: &mut [Index]) -> Result<()> {
+    let needs_recalculating = match detect_overlapping_fragments(indices) {
+        Ok(()) => vec![],
+        Err(BadFragmentBitmapError { bad_indices }) => {
+            bad_indices.into_iter().map(|(name, _)| name).collect()
+        }
+    };
     for index in indices {
-        if must_recalculate_fragment_bitmap(index, dataset.manifest.writer_version.as_ref()) {
+        if needs_recalculating.contains(&index.name)
+            || must_recalculate_fragment_bitmap(index, dataset.manifest.writer_version.as_ref())
+        {
             debug_assert_eq!(index.fields.len(), 1);
             let idx_field = dataset.schema().field_by_id(index.fields[0]).ok_or_else(|| Error::Internal { message: format!("Index with uuid {} referred to field with id {} which did not exist in dataset", index.uuid, index.fields[0]), location: location!() })?;
             // We need to calculate the fragments covered by the index
             let idx = dataset
-                .open_generic_index(&idx_field.name, &index.uuid.to_string())
+                .open_generic_index(
+                    &idx_field.name,
+                    &index.uuid.to_string(),
+                    &NoOpMetricsCollector,
+                )
                 .await?;
             index.fragment_bitmap = Some(idx.calculate_included_frags().await?);
         }
@@ -517,6 +529,40 @@ async fn migrate_indices(dataset: &Dataset, indices: &mut [Index]) -> Result<()>
     Ok(())
 }
 
+pub(crate) struct BadFragmentBitmapError {
+    pub bad_indices: Vec<(String, Vec<u32>)>,
+}
+
+/// Detect whether a given index has overlapping fragment bitmaps in it's index
+/// segments.
+pub(crate) fn detect_overlapping_fragments(
+    indices: &[Index],
+) -> std::result::Result<(), BadFragmentBitmapError> {
+    let index_names: HashSet<&str> = indices.iter().map(|i| i.name.as_str()).collect();
+    let mut bad_indices = Vec::new(); // (index_name, overlapping_fragments)
+    for name in index_names {
+        let mut seen_fragment_ids = HashSet::new();
+        let mut overlap = Vec::new();
+        for index in indices.iter().filter(|i| i.name == name) {
+            if let Some(fragment_bitmap) = index.fragment_bitmap.as_ref() {
+                for fragment in fragment_bitmap {
+                    if !seen_fragment_ids.insert(fragment) {
+                        overlap.push(fragment);
+                    }
+                }
+            }
+        }
+        if !overlap.is_empty() {
+            bad_indices.push((name.to_string(), overlap));
+        }
+    }
+    if bad_indices.is_empty() {
+        Ok(())
+    } else {
+        Err(BadFragmentBitmapError { bad_indices })
+    }
+}
+
 pub(crate) async fn do_commit_detached_transaction(
     dataset: &Dataset,
     object_store: &ObjectStore,
@@ -525,7 +571,7 @@ pub(crate) async fn do_commit_detached_transaction(
     write_config: &ManifestWriteConfig,
     commit_config: &CommitConfig,
     new_blob_version: Option<u64>,
-) -> Result<(Manifest, Path)> {
+) -> Result<(Manifest, Path, Option<String>)> {
     // We don't strictly need a transaction file but we go ahead and create one for
     // record-keeping if nothing else.
     let transaction_file = write_transaction_file(object_store, &dataset.base, transaction).await?;
@@ -583,8 +629,8 @@ pub(crate) async fn do_commit_detached_transaction(
         .await;
 
         match result {
-            Ok(path) => {
-                return Ok((manifest, path));
+            Ok(location) => {
+                return Ok((manifest, location.path, location.e_tag));
             }
             Err(CommitError::CommitConflict) => {
                 // We pick a random u64 for the version, so it's possible (though extremely unlikely)
@@ -620,12 +666,12 @@ pub(crate) async fn commit_detached_transaction(
     transaction: &Transaction,
     write_config: &ManifestWriteConfig,
     commit_config: &CommitConfig,
-) -> Result<(Manifest, Path)> {
+) -> Result<(Manifest, Path, Option<String>)> {
     let new_blob_version = if let Some(blob_op) = transaction.blobs_op.as_ref() {
         let blobs_dataset = dataset.blobs_dataset().await?.unwrap();
         let blobs_tx =
             Transaction::new(blobs_dataset.version().version, blob_op.clone(), None, None);
-        let (blobs_manifest, _) = do_commit_detached_transaction(
+        let (blobs_manifest, _, _) = do_commit_detached_transaction(
             blobs_dataset.as_ref(),
             object_store,
             commit_handler,
@@ -661,12 +707,12 @@ pub(crate) async fn commit_transaction(
     write_config: &ManifestWriteConfig,
     commit_config: &CommitConfig,
     manifest_naming_scheme: ManifestNamingScheme,
-) -> Result<(Manifest, Path)> {
+) -> Result<(Manifest, Path, Option<String>)> {
     let new_blob_version = if let Some(blob_op) = transaction.blobs_op.as_ref() {
         let blobs_dataset = dataset.blobs_dataset().await?.unwrap();
         let blobs_tx =
             Transaction::new(blobs_dataset.version().version, blob_op.clone(), None, None);
-        let (blobs_manifest, _) = do_commit_detached_transaction(
+        let (blobs_manifest, _, _) = do_commit_detached_transaction(
             blobs_dataset.as_ref(),
             object_store,
             commit_handler,
@@ -780,14 +826,14 @@ pub(crate) async fn commit_transaction(
         .await;
 
         match result {
-            Ok(manifest_path) => {
+            Ok(manifest_location) => {
                 let cache_path = transaction_file_cache_path(&dataset.base, target_version);
                 dataset
                     .session()
                     .file_metadata_cache
                     .insert(cache_path, Arc::new(transaction.clone()));
 
-                return Ok((manifest, manifest_path));
+                return Ok((manifest, manifest_location.path, manifest_location.e_tag));
             }
             Err(CommitError::CommitConflict) => {
                 // See if we can retry the commit. Try to account for all

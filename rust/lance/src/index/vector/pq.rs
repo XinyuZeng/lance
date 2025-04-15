@@ -5,25 +5,28 @@ use std::sync::Arc;
 use std::{any::Any, collections::HashMap};
 
 use arrow::compute::concat;
-use arrow_array::UInt32Array;
 use arrow_array::{
     cast::{as_primitive_array, AsArray},
     Array, FixedSizeListArray, RecordBatch, UInt64Array, UInt8Array,
 };
+use arrow_array::{ArrayRef, Float32Array, UInt32Array};
 use arrow_ord::sort::sort_to_indices;
-use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+use arrow_schema::{DataType, Field, Schema};
 use arrow_select::take::take;
 use async_trait::async_trait;
+use datafusion::execution::SendableRecordBatchStream;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use deepsize::DeepSizeOf;
+use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::spawn_cpu;
-use lance_core::ROW_ID;
-use lance_core::{utils::address::RowAddress, ROW_ID_FIELD};
+use lance_core::{ROW_ID, ROW_ID_FIELD};
+use lance_index::metrics::MetricsCollector;
 use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::pq::storage::{transpose, ProductQuantizationStorage};
 use lance_index::vector::quantizer::{Quantization, QuantizationType, Quantizer};
 use lance_index::vector::v3::subindex::SubIndexType;
 use lance_index::{
-    vector::{pq::ProductQuantizer, Query, DIST_COL},
+    vector::{pq::ProductQuantizer, Query},
     Index, IndexType,
 };
 use lance_io::{traits::Reader, utils::read_fixed_stride_array};
@@ -31,7 +34,7 @@ use lance_linalg::distance::{DistanceType, MetricType};
 use log::{info, warn};
 use roaring::RoaringBitmap;
 use serde_json::json;
-use snafu::{location, Location};
+use snafu::location;
 use tracing::{instrument, span, Level};
 
 // Re-export
@@ -41,6 +44,7 @@ use lance_linalg::kernels::normalize_fsl;
 use super::VectorIndex;
 use crate::index::prefilter::PreFilter;
 use crate::index::vector::utils::maybe_sample_training_data;
+use crate::io::exec::knn::KNN_INDEX_SCHEMA;
 use crate::{arrow::*, Dataset};
 use crate::{Error, Result};
 
@@ -198,7 +202,12 @@ impl VectorIndex for PQIndex {
     /// Search top-k nearest neighbors for `key` within one PQ partition.
     ///
     #[instrument(level = "debug", skip_all, name = "PQIndex::search")]
-    async fn search(&self, query: &Query, pre_filter: Arc<dyn PreFilter>) -> Result<RecordBatch> {
+    async fn search(
+        &self,
+        query: &Query,
+        pre_filter: Arc<dyn PreFilter>,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<RecordBatch> {
         if self.code.is_none() || self.row_ids.is_none() {
             return Err(Error::Index {
                 message: "PQIndex::search: PQ is not initialized".to_string(),
@@ -209,6 +218,8 @@ impl VectorIndex for PQIndex {
 
         let code = self.code.as_ref().unwrap().clone();
         let row_ids = self.row_ids.as_ref().unwrap().clone();
+
+        metrics.record_comparisons(row_ids.len());
 
         let pq = self.pq.clone();
         let query = query.clone();
@@ -226,15 +237,42 @@ impl VectorIndex for PQIndex {
             debug_assert_eq!(distances.len(), row_ids.len());
 
             let limit = query.k * query.refine_factor.unwrap_or(1) as usize;
-            let indices = sort_to_indices(&distances, None, Some(limit))?;
-            let distances = take(&distances, &indices, None)?;
-            let row_ids = take(row_ids.as_ref(), &indices, None)?;
+            if query.lower_bound.is_none() && query.upper_bound.is_none() {
+                let indices = sort_to_indices(&distances, None, Some(limit))?;
+                let distances = take(&distances, &indices, None)?;
+                let row_ids = take(row_ids.as_ref(), &indices, None)?;
+                Ok(RecordBatch::try_new(
+                    KNN_INDEX_SCHEMA.clone(),
+                    vec![distances, row_ids],
+                )?)
+            } else {
+                let indices = sort_to_indices(&distances, None, None)?;
+                let mut dists = Vec::with_capacity(limit);
+                let mut ids = Vec::with_capacity(limit);
+                for idx in indices.values().iter() {
+                    let dist = distances.value(*idx as usize);
+                    let id = row_ids.value(*idx as usize);
+                    if query.lower_bound.is_some_and(|lb| dist < lb) {
+                        continue;
+                    }
+                    if query.upper_bound.is_some_and(|ub| dist >= ub) {
+                        break;
+                    }
 
-            let schema = Arc::new(ArrowSchema::new(vec![
-                ArrowField::new(DIST_COL, DataType::Float32, true),
-                ROW_ID_FIELD.clone(),
-            ]));
-            Ok(RecordBatch::try_new(schema, vec![distances, row_ids])?)
+                    dists.push(dist);
+                    ids.push(id);
+
+                    if dists.len() >= limit {
+                        break;
+                    }
+                }
+                let dists = Arc::new(Float32Array::from(dists));
+                let ids = Arc::new(UInt64Array::from(ids));
+                Ok(RecordBatch::try_new(
+                    KNN_INDEX_SCHEMA.clone(),
+                    vec![dists, ids],
+                )?)
+            }
         })
         .await
     }
@@ -248,6 +286,7 @@ impl VectorIndex for PQIndex {
         _: usize,
         _: &Query,
         _: Arc<dyn PreFilter>,
+        _: &dyn MetricsCollector,
     ) -> Result<RecordBatch> {
         unimplemented!("only for IVF")
     }
@@ -301,6 +340,49 @@ impl VectorIndex for PQIndex {
         }))
     }
 
+    async fn to_batch_stream(&self, with_vector: bool) -> Result<SendableRecordBatchStream> {
+        let row_ids = self.row_ids.clone().ok_or(Error::Index {
+            message: "PQIndex::to_batch_stream: row ids not loaded for PQ".to_string(),
+            location: location!(),
+        })?;
+
+        let num_rows = row_ids.len();
+        let mut fields = vec![ROW_ID_FIELD.clone()];
+        let mut columns: Vec<ArrayRef> = vec![row_ids];
+        if with_vector {
+            let transposed_codes = self.code.clone().ok_or(Error::Index {
+                message: "PQIndex::to_batch_stream: PQ codes not loaded for PQ".to_string(),
+                location: location!(),
+            })?;
+            let original_codes = transpose(&transposed_codes, self.pq.num_sub_vectors, num_rows);
+            fields.push(Field::new(
+                self.pq.column(),
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::UInt8, true)),
+                    self.pq.code_dim() as i32,
+                ),
+                true,
+            ));
+            columns.push(Arc::new(FixedSizeListArray::try_new_from_values(
+                original_codes,
+                self.pq.code_dim() as i32,
+            )?));
+        }
+
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?;
+        let stream = RecordBatchStreamAdapter::new(
+            batch.schema(),
+            futures::stream::once(futures::future::ready(Ok(batch))),
+        );
+        Ok(Box::pin(stream))
+    }
+
+    fn num_rows(&self) -> u64 {
+        self.row_ids
+            .as_ref()
+            .map_or(0, |row_ids| row_ids.len() as u64)
+    }
+
     fn row_ids(&self) -> Box<dyn Iterator<Item = &u64>> {
         todo!("this method is for only IVF_HNSW_* index");
     }
@@ -309,7 +391,7 @@ impl VectorIndex for PQIndex {
         Ok(())
     }
 
-    fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
+    async fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
         let num_vectors = self.row_ids.as_ref().unwrap().len();
         let row_ids = self.row_ids.as_ref().unwrap().values().iter();
         let transposed_codes = self.code.as_ref().unwrap();
@@ -343,7 +425,7 @@ impl VectorIndex for PQIndex {
         Ok(())
     }
 
-    fn ivf_model(&self) -> IvfModel {
+    fn ivf_model(&self) -> &IvfModel {
         unimplemented!("only for IVF")
     }
     fn quantizer(&self) -> Quantizer {
@@ -419,10 +501,11 @@ pub async fn build_pq_model(
         "Finished loading training data in {:02} seconds",
         start.elapsed().as_secs_f32()
     );
+    assert_eq!(training_data.logical_null_count(), 0);
 
     info!(
         "starting to compute partitions for PQ training, sample size: {}",
-        training_data.value_length()
+        training_data.len()
     );
 
     if metric_type == MetricType::Cosine {
@@ -542,7 +625,7 @@ mod tests {
 
         let centroids = generate_random_array_with_range::<Float32Type>(4 * DIM, -1.0..1.0);
         let fsl = FixedSizeListArray::try_new_from_values(centroids, DIM as i32).unwrap();
-        let ivf = IvfModel::new(fsl);
+        let ivf = IvfModel::new(fsl, None);
         let params = PQBuildParams::new(16, 8);
         let pq = build_pq_model(&dataset, "vector", DIM, MetricType::L2, &params, Some(&ivf))
             .await

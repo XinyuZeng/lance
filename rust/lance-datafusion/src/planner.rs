@@ -23,7 +23,7 @@ use datafusion::config::ConfigOptions;
 use datafusion::error::Result as DFResult;
 use datafusion::execution::config::SessionConfig;
 use datafusion::execution::context::SessionState;
-use datafusion::execution::runtime_env::{RuntimeConfig, RuntimeEnv};
+use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::planner::{ExprPlanner, PlannerResult, RawFieldAccessExpr};
@@ -34,13 +34,13 @@ use datafusion::logical_expr::{
 use datafusion::optimizer::simplify_expressions::SimplifyContext;
 use datafusion::sql::planner::{ContextProvider, ParserOptions, PlannerContext, SqlToRel};
 use datafusion::sql::sqlparser::ast::{
-    Array as SQLArray, BinaryOperator, DataType as SQLDataType, ExactNumberInfo, Expr as SQLExpr,
-    Function, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, Subscript, TimezoneInfo,
-    UnaryOperator, Value,
+    AccessExpr, Array as SQLArray, BinaryOperator, DataType as SQLDataType, ExactNumberInfo,
+    Expr as SQLExpr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, Subscript,
+    TimezoneInfo, UnaryOperator, Value,
 };
 use datafusion::{
     common::Column,
-    logical_expr::{col, BinaryExpr, Like, Operator},
+    logical_expr::{col, Between, BinaryExpr, Like, Operator},
     physical_expr::execution_props::ExecutionProps,
     physical_plan::PhysicalExpr,
     prelude::Expr,
@@ -49,7 +49,7 @@ use datafusion::{
 use datafusion_functions::core::getfield::GetFieldFunc;
 use lance_arrow::cast::cast_with_options;
 use lance_core::datatypes::Schema;
-use snafu::{location, Location};
+use snafu::location;
 
 use lance_core::{Error, Result};
 
@@ -162,8 +162,7 @@ struct LanceContextProvider {
 impl Default for LanceContextProvider {
     fn default() -> Self {
         let config = SessionConfig::new();
-        let runtime_config = RuntimeConfig::new();
-        let runtime = Arc::new(RuntimeEnv::new(runtime_config).unwrap());
+        let runtime = RuntimeEnvBuilder::new().build_arc().unwrap();
         let mut state_builder = SessionStateBuilder::new()
             .with_config(config)
             .with_runtime_env(runtime)
@@ -415,6 +414,7 @@ impl Planner {
                 enable_ident_normalization: false,
                 support_varchar_with_length: false,
                 enable_options_value_normalization: false,
+                collect_spans: false,
             },
         );
 
@@ -443,7 +443,7 @@ impl Planner {
             SQLDataType::String(_) => Ok(ArrowDataType::Utf8),
             SQLDataType::Binary(_) => Ok(ArrowDataType::Binary),
             SQLDataType::Float(_) => Ok(ArrowDataType::Float32),
-            SQLDataType::Double => Ok(ArrowDataType::Float64),
+            SQLDataType::Double(_) => Ok(ArrowDataType::Float64),
             SQLDataType::Boolean => Ok(ArrowDataType::Boolean),
             SQLDataType::TinyInt(_) => Ok(ArrowDataType::Int8),
             SQLDataType::SmallInt(_) => Ok(ArrowDataType::Int16),
@@ -636,7 +636,7 @@ impl Planner {
                 }))
             }
             SQLExpr::IsFalse(expr) => Ok(Expr::IsFalse(Box::new(self.parse_sql_expr(expr)?))),
-            SQLExpr::IsNotFalse(_) => Ok(Expr::IsNotFalse(Box::new(self.parse_sql_expr(expr)?))),
+            SQLExpr::IsNotFalse(expr) => Ok(Expr::IsNotFalse(Box::new(self.parse_sql_expr(expr)?))),
             SQLExpr::IsTrue(expr) => Ok(Expr::IsTrue(Box::new(self.parse_sql_expr(expr)?))),
             SQLExpr::IsNotTrue(expr) => Ok(Expr::IsNotTrue(Box::new(self.parse_sql_expr(expr)?))),
             SQLExpr::IsNull(expr) => Ok(Expr::IsNull(Box::new(self.parse_sql_expr(expr)?))),
@@ -660,6 +660,7 @@ impl Planner {
                 expr,
                 pattern,
                 escape_char,
+                any: _,
             } => Ok(Expr::Like(Like::new(
                 *negated,
                 Box::new(self.parse_sql_expr(expr)?),
@@ -672,6 +673,7 @@ impl Planner {
                 expr,
                 pattern,
                 escape_char,
+                any: _,
             } => Ok(Expr::Like(Like::new(
                 *negated,
                 Box::new(self.parse_sql_expr(expr)?),
@@ -685,66 +687,69 @@ impl Planner {
                 expr: Box::new(self.parse_sql_expr(expr)?),
                 data_type: self.parse_type(data_type)?,
             })),
-            SQLExpr::MapAccess { column, keys } => {
-                let mut expr = self.parse_sql_expr(column)?;
+            SQLExpr::JsonAccess { .. } => Err(Error::invalid_input(
+                "JSON access is not supported",
+                location!(),
+            )),
+            SQLExpr::CompoundFieldAccess { root, access_chain } => {
+                let mut expr = self.parse_sql_expr(root)?;
 
-                for key in keys {
-                    let field_access = match &key.key {
-                        SQLExpr::Value(
-                            Value::SingleQuotedString(s) | Value::DoubleQuotedString(s),
-                        ) => GetFieldAccess::NamedStructField {
+                for access in access_chain {
+                    let field_access = match access {
+                        // x.y or x['y']
+                        AccessExpr::Dot(SQLExpr::Identifier(Ident { value: s, .. }))
+                        | AccessExpr::Subscript(Subscript::Index {
+                            index:
+                                SQLExpr::Value(
+                                    Value::SingleQuotedString(s) | Value::DoubleQuotedString(s),
+                                ),
+                        }) => GetFieldAccess::NamedStructField {
                             name: ScalarValue::from(s.as_str()),
                         },
-                        SQLExpr::JsonAccess { .. } => {
+                        AccessExpr::Subscript(Subscript::Index { index }) => {
+                            let key = Box::new(self.parse_sql_expr(index)?);
+                            GetFieldAccess::ListIndex { key }
+                        }
+                        AccessExpr::Subscript(Subscript::Slice { .. }) => {
                             return Err(Error::invalid_input(
-                                "JSON access is not supported",
+                                "Slice subscript is not supported",
                                 location!(),
                             ));
                         }
-                        key => {
-                            let key = Box::new(self.parse_sql_expr(key)?);
-                            GetFieldAccess::ListIndex { key }
+                        _ => {
+                            // Handle other cases like JSON access
+                            // Note: JSON access is not supported in lance
+                            return Err(Error::invalid_input(
+                                "Only dot notation or index access is supported for field access",
+                                location!(),
+                            ));
                         }
                     };
 
                     let field_access_expr = RawFieldAccessExpr { expr, field_access };
-
                     expr = self.plan_field_access(field_access_expr)?;
                 }
 
                 Ok(expr)
             }
-            SQLExpr::Subscript { expr, subscript } => {
+            SQLExpr::Between {
+                expr,
+                negated,
+                low,
+                high,
+            } => {
+                // Parse the main expression and bounds
                 let expr = self.parse_sql_expr(expr)?;
+                let low = self.parse_sql_expr(low)?;
+                let high = self.parse_sql_expr(high)?;
 
-                let field_access = match subscript.as_ref() {
-                    Subscript::Index { index } => match index {
-                        SQLExpr::Value(
-                            Value::SingleQuotedString(s) | Value::DoubleQuotedString(s),
-                        ) => GetFieldAccess::NamedStructField {
-                            name: ScalarValue::from(s.as_str()),
-                        },
-                        SQLExpr::JsonAccess { .. } => {
-                            return Err(Error::invalid_input(
-                                "JSON access is not supported",
-                                location!(),
-                            ));
-                        }
-                        _ => {
-                            let key = Box::new(self.parse_sql_expr(index)?);
-                            GetFieldAccess::ListIndex { key }
-                        }
-                    },
-                    Subscript::Slice { .. } => {
-                        return Err(Error::invalid_input(
-                            "Slice subscript is not supported",
-                            location!(),
-                        ));
-                    }
-                };
-
-                let field_access_expr = RawFieldAccessExpr { expr, field_access };
-                self.plan_field_access(field_access_expr)
+                let between = Expr::Between(Between::new(
+                    Box::new(expr),
+                    *negated,
+                    Box::new(low),
+                    Box::new(high),
+                ));
+                Ok(between)
             }
             _ => Err(Error::invalid_input(
                 format!("Expression '{expr}' is not supported SQL in lance"),
@@ -796,7 +801,7 @@ impl Planner {
         for i in (start_idx..hex_bytes.len()).step_by(2) {
             let high = Self::try_decode_hex_char(hex_bytes[i])?;
             let low = Self::try_decode_hex_char(hex_bytes[i + 1])?;
-            decoded_bytes.push(high << 4 | low);
+            decoded_bytes.push((high << 4) | low);
         }
 
         Some(decoded_bytes)
@@ -1025,20 +1030,14 @@ mod tests {
             }
         }
 
-        let expected = Expr::Column(Column {
-            relation: None,
-            name: "s0".to_string(),
-        });
+        let expected = Expr::Column(Column::new_unqualified("s0"));
         assert_column_eq(&planner, "s0", &expected);
         assert_column_eq(&planner, "`s0`", &expected);
 
         let expected = Expr::ScalarFunction(ScalarFunction {
             func: Arc::new(ScalarUDF::new_from_impl(GetFieldFunc::default())),
             args: vec![
-                Expr::Column(Column {
-                    relation: None,
-                    name: "st".to_string(),
-                }),
+                Expr::Column(Column::new_unqualified("st")),
                 Expr::Literal(ScalarValue::Utf8(Some("s1".to_string()))),
             ],
         });
@@ -1052,10 +1051,7 @@ mod tests {
                 Expr::ScalarFunction(ScalarFunction {
                     func: Arc::new(ScalarUDF::new_from_impl(GetFieldFunc::default())),
                     args: vec![
-                        Expr::Column(Column {
-                            relation: None,
-                            name: "st".to_string(),
-                        }),
+                        Expr::Column(Column::new_unqualified("st")),
                         Expr::Literal(ScalarValue::Utf8(Some("st".to_string()))),
                     ],
                 }),
@@ -1461,6 +1457,98 @@ mod tests {
                 _ => panic!("Expected binary expression"),
             }
         }
+    }
+
+    #[test]
+    fn test_sql_between() {
+        use arrow_array::{Float64Array, Int32Array, TimestampMicrosecondArray};
+        use arrow_schema::{DataType, Field, Schema, TimeUnit};
+        use std::sync::Arc;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("x", DataType::Int32, false),
+            Field::new("y", DataType::Float64, false),
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                false,
+            ),
+        ]));
+
+        let planner = Planner::new(schema.clone());
+
+        // Test integer BETWEEN
+        let expr = planner
+            .parse_filter("x BETWEEN CAST(3 AS INT) AND CAST(7 AS INT)")
+            .unwrap();
+        let physical_expr = planner.create_physical_expr(&expr).unwrap();
+
+        // Create timestamp array with values representing:
+        // 2024-01-01 00:00:00 to 2024-01-01 00:00:09 (in microseconds)
+        let base_ts = 1704067200000000_i64; // 2024-01-01 00:00:00
+        let ts_array = TimestampMicrosecondArray::from_iter_values(
+            (0..10).map(|i| base_ts + i * 1_000_000), // Each value is 1 second apart
+        );
+
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..10)) as ArrayRef,
+                Arc::new(Float64Array::from_iter_values((0..10).map(|v| v as f64))),
+                Arc::new(ts_array),
+            ],
+        )
+        .unwrap();
+
+        let predicates = physical_expr.evaluate(&batch).unwrap();
+        assert_eq!(
+            predicates.into_array(0).unwrap().as_ref(),
+            &BooleanArray::from(vec![
+                false, false, false, true, true, true, true, true, false, false
+            ])
+        );
+
+        // Test NOT BETWEEN
+        let expr = planner
+            .parse_filter("x NOT BETWEEN CAST(3 AS INT) AND CAST(7 AS INT)")
+            .unwrap();
+        let physical_expr = planner.create_physical_expr(&expr).unwrap();
+
+        let predicates = physical_expr.evaluate(&batch).unwrap();
+        assert_eq!(
+            predicates.into_array(0).unwrap().as_ref(),
+            &BooleanArray::from(vec![
+                true, true, true, false, false, false, false, false, true, true
+            ])
+        );
+
+        // Test floating point BETWEEN
+        let expr = planner.parse_filter("y BETWEEN 2.5 AND 6.5").unwrap();
+        let physical_expr = planner.create_physical_expr(&expr).unwrap();
+
+        let predicates = physical_expr.evaluate(&batch).unwrap();
+        assert_eq!(
+            predicates.into_array(0).unwrap().as_ref(),
+            &BooleanArray::from(vec![
+                false, false, false, true, true, true, true, false, false, false
+            ])
+        );
+
+        // Test timestamp BETWEEN
+        let expr = planner
+            .parse_filter(
+                "ts BETWEEN timestamp '2024-01-01 00:00:03' AND timestamp '2024-01-01 00:00:07'",
+            )
+            .unwrap();
+        let physical_expr = planner.create_physical_expr(&expr).unwrap();
+
+        let predicates = physical_expr.evaluate(&batch).unwrap();
+        assert_eq!(
+            predicates.into_array(0).unwrap().as_ref(),
+            &BooleanArray::from(vec![
+                false, false, false, true, true, true, true, true, false, false
+            ])
+        );
     }
 
     #[test]

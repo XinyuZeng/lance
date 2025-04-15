@@ -11,7 +11,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package com.lancedb.lance;
 
 import com.lancedb.lance.ipc.LanceScanner;
@@ -26,6 +25,7 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
 import java.nio.file.Path;
+import java.util.Arrays;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
@@ -103,7 +103,13 @@ public class FilterTest {
   }
 
   private void testFilter(String filter, int expectedCount) throws Exception {
-    try (LanceScanner scanner = dataset.newScan(new ScanOptions.Builder().filter(filter).build())) {
+    try (LanceScanner scanner =
+        dataset.newScan(
+            new ScanOptions.Builder()
+                .columns(Arrays.asList())
+                .withRowId(true)
+                .filter(filter)
+                .build())) {
       assertEquals(expectedCount, scanner.countRows());
     }
   }

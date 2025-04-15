@@ -15,6 +15,7 @@
 use std::sync::Arc;
 
 use arrow::compute::concat;
+use arrow::datatypes::Float32Type;
 use arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use arrow_array::{cast::AsArray, Array, FixedSizeListArray, Float32Array, UInt32Array};
 use arrow_data::ArrayData;
@@ -23,20 +24,26 @@ use lance::Result;
 use lance::{datatypes::Schema, io::ObjectStore};
 use lance_arrow::FixedSizeListArrayExt;
 use lance_file::writer::FileWriter;
+use lance_index::scalar::inverted::query::{
+    BoostQuery, FtsQuery, MatchQuery, MultiMatchQuery, PhraseQuery,
+};
 use lance_index::scalar::IndexWriter;
 use lance_index::vector::hnsw::{builder::HnswBuildParams, HNSW};
 use lance_index::vector::v3::subindex::IvfSubIndex;
-use lance_linalg::kmeans::compute_partitions;
+use lance_linalg::kmeans::{compute_partitions, KMeansAlgoFloat};
 use lance_linalg::{
     distance::DistanceType,
     kmeans::{KMeans as LanceKMeans, KMeansParams},
 };
 use lance_table::io::manifest::ManifestDescribing;
 use object_store::path::Path;
+use pyo3::intern;
+use pyo3::types::PyDict;
 use pyo3::{
     exceptions::{PyIOError, PyRuntimeError, PyValueError},
     prelude::*,
     types::PyIterator,
+    IntoPyObjectExt,
 };
 
 use crate::RT;
@@ -132,14 +139,17 @@ impl KMeans {
         if !matches!(fixed_size_arr.value_type(), DataType::Float32) {
             return Err(PyValueError::new_err("Must be a FixedSizeList of Float32"));
         };
-        let values: Arc<Float32Array> = fixed_size_arr.values().as_primitive().clone().into();
-        let centroids: &Float32Array = kmeans.centroids.as_primitive();
-        let cluster_ids = UInt32Array::from(compute_partitions(
-            centroids.values(),
-            values.values(),
-            kmeans.dimension,
-            kmeans.distance_type,
-        ));
+        let values = fixed_size_arr.values().as_primitive();
+        let centroids = kmeans.centroids.as_primitive();
+        let cluster_ids = UInt32Array::from(
+            compute_partitions::<Float32Type, KMeansAlgoFloat<Float32Type>>(
+                centroids,
+                values,
+                kmeans.dimension,
+                kmeans.distance_type,
+            )
+            .0,
+        );
         cluster_ids.into_data().to_pyarrow(py)
     }
 
@@ -240,5 +250,150 @@ impl Hnsw {
 
     fn vectors(&self, py: Python) -> PyResult<PyObject> {
         self.vectors.to_data().to_pyarrow(py)
+    }
+}
+
+/// A newtype wrapper for a Lance type.
+///
+/// This is used for types that have a corresponding dataclass in Python.
+pub struct PyLance<T>(pub T);
+
+/// Extract a Vec of PyLance types from a Python object.
+pub fn extract_vec<'a, T>(ob: &Bound<'a, PyAny>) -> PyResult<Vec<T>>
+where
+    PyLance<T>: FromPyObject<'a>,
+{
+    ob.extract::<Vec<PyLance<T>>>()
+        .map(|v| v.into_iter().map(|t| t.0).collect())
+}
+
+/// Export a Vec of Lance types to a Python object.
+pub fn export_vec<'a, T>(py: Python<'a>, vec: &'a [T]) -> PyResult<Vec<PyObject>>
+where
+    PyLance<&'a T>: IntoPyObject<'a>,
+{
+    vec.iter()
+        .map(|t| PyLance(t).into_py_any(py))
+        .collect::<std::result::Result<Vec<_>, _>>()
+}
+
+pub fn class_name(ob: &Bound<'_, PyAny>) -> PyResult<String> {
+    let full_name: String = ob
+        .getattr(intern!(ob.py(), "__class__"))?
+        .getattr(intern!(ob.py(), "__name__"))?
+        .extract()?;
+    match full_name.rsplit_once('.') {
+        Some((_, name)) => Ok(name.to_string()),
+        None => Ok(full_name),
+    }
+}
+
+pub fn parse_fts_query(query: &Bound<'_, PyDict>) -> PyResult<FtsQuery> {
+    let query_type = query.keys().get_item(0)?.extract::<String>()?;
+    let query_value = query
+        .get_item(&query_type)?
+        .ok_or(PyValueError::new_err(format!(
+            "Query type {} not found",
+            query_type
+        )))?;
+    let query_value = query_value.downcast::<PyDict>()?;
+
+    match query_type.as_str() {
+        "match" => {
+            let column = query_value.keys().get_item(0)?.extract::<String>()?;
+            let params = query_value
+                .get_item(&column)?
+                .ok_or(PyValueError::new_err(format!(
+                    "column {} not found",
+                    column
+                )))?;
+            let params = params.downcast::<PyDict>()?;
+
+            let query = params
+                .get_item("query")?
+                .ok_or(PyValueError::new_err("query not found"))?
+                .extract::<String>()?;
+            let boost = params
+                .get_item("boost")?
+                .ok_or(PyValueError::new_err("boost not found"))?
+                .extract::<f32>()?;
+            let fuzziness = params
+                .get_item("fuzziness")?
+                .ok_or(PyValueError::new_err("fuzziness not found"))?
+                .extract::<Option<u32>>()?;
+            let max_expansions = params
+                .get_item("max_expansions")?
+                .ok_or(PyValueError::new_err("max_expansions not found"))?
+                .extract::<usize>()?;
+
+            let query = MatchQuery::new(query)
+                .with_column(Some(column))
+                .with_boost(boost)
+                .with_fuzziness(fuzziness)
+                .with_max_expansions(max_expansions);
+            Ok(query.into())
+        }
+
+        "match_phrase" => {
+            let column = query_value.keys().get_item(0)?.extract::<String>()?;
+            let query = query_value
+                .get_item(&column)?
+                .ok_or(PyValueError::new_err(format!(
+                    "column {} not found",
+                    column
+                )))?
+                .extract::<String>()?;
+
+            let query = PhraseQuery::new(query).with_column(Some(column));
+            Ok(query.into())
+        }
+
+        "boost" => {
+            let positive: Bound<'_, PyAny> = query_value
+                .get_item("positive")?
+                .ok_or(PyValueError::new_err("positive not found"))?;
+            let positive = positive.downcast::<PyDict>()?;
+
+            let negative = query_value
+                .get_item("negative")?
+                .ok_or(PyValueError::new_err("negative not found"))?;
+            let negative = negative.downcast::<PyDict>()?;
+
+            let negative_boost = query_value
+                .get_item("negative_boost")?
+                .ok_or(PyValueError::new_err("negative_boost not found"))?
+                .extract::<f32>()?;
+
+            let positive_query = parse_fts_query(positive)?;
+            let negative_query = parse_fts_query(negative)?;
+            let query = BoostQuery::new(positive_query, negative_query, Some(negative_boost));
+
+            Ok(query.into())
+        }
+
+        "multi_match" => {
+            let query = query_value
+                .get_item("query")?
+                .ok_or(PyValueError::new_err("query not found"))?
+                .extract::<String>()?;
+
+            let columns = query_value
+                .get_item("columns")?
+                .ok_or(PyValueError::new_err("columns not found"))?
+                .extract::<Vec<String>>()?;
+
+            let boost = query_value
+                .get_item("boost")?
+                .ok_or(PyValueError::new_err("boost not found"))?
+                .extract::<Vec<f32>>()?;
+
+            let query = MultiMatchQuery::with_boosts(query, columns, boost);
+            Ok(query.into())
+        }
+
+        _ => Err(PyValueError::new_err(format!(
+            "Unsupported query type: {}",
+            query_type
+        ))),
     }
 }

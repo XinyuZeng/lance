@@ -20,6 +20,7 @@ use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::Error;
 use lance_file::reader::FileReader;
 use lance_file::writer::FileWriter;
+use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::scalar::IndexWriter;
 use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::hnsw::{builder::HnswBuildParams, HnswMetadata};
@@ -38,7 +39,7 @@ use lance_linalg::kernels::normalize_fsl;
 use lance_table::format::SelfDescribingFileReader;
 use lance_table::io::manifest::ManifestDescribing;
 use object_store::path::Path;
-use snafu::{location, Location};
+use snafu::location;
 use tempfile::TempDir;
 use tokio::sync::Semaphore;
 
@@ -190,7 +191,9 @@ pub(super) async fn write_pq_partitions(
 
         if let Some(&previous_indices) = existing_indices.as_ref() {
             for &idx in previous_indices.iter() {
-                let sub_index = idx.load_partition(part_id as usize, true).await?;
+                let sub_index = idx
+                    .load_partition(part_id as usize, true, &NoOpMetricsCollector)
+                    .await?;
                 let pq_index =
                     sub_index
                         .as_any()
@@ -312,7 +315,9 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
 
         if let Some(&previous_indices) = existing_indices.as_ref() {
             for &idx in previous_indices.iter() {
-                let sub_index = idx.load_partition(part_id, true).await?;
+                let sub_index = idx
+                    .load_partition(part_id, true, &NoOpMetricsCollector)
+                    .await?;
                 let row_ids = Arc::new(UInt64Array::from_iter_values(sub_index.row_ids().cloned()));
                 row_id_array.push(row_ids);
             }
@@ -320,6 +325,7 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
 
         let code_column = match &quantizer {
             Quantizer::Flat(_) => None,
+            Quantizer::FlatBin(_) => None,
             Quantizer::Product(pq) => Some(pq.column()),
             Quantizer::Scalar(_) => None,
         };
@@ -547,10 +553,12 @@ async fn build_and_write_pq_storage(
 mod tests {
     use super::*;
 
+    use crate::index::vector::ivf::v2;
     use crate::index::{vector::VectorIndexParams, DatasetIndexExt, DatasetIndexInternalExt};
     use crate::Dataset;
     use arrow_array::RecordBatchIterator;
     use arrow_schema::{Field, Schema};
+    use lance_index::metrics::NoOpMetricsCollector;
     use lance_index::IndexType;
     use lance_testing::datagen::generate_random_array;
 
@@ -597,12 +605,16 @@ mod tests {
         assert_eq!(ds.get_fragments().len(), 2);
 
         let idx = ds
-            .open_vector_index("vector", &indices[0].uuid.to_string())
+            .open_vector_index(
+                "vector",
+                &indices[0].uuid.to_string(),
+                &NoOpMetricsCollector,
+            )
             .await
             .unwrap();
         let _ivf_idx = idx
             .as_any()
-            .downcast_ref::<IVFIndex>()
+            .downcast_ref::<v2::IvfPq>()
             .expect("Invalid index type");
 
         //let indices = /ds.

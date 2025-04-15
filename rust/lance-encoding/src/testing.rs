@@ -4,7 +4,7 @@
 use std::{cmp::Ordering, collections::HashMap, ops::Range, sync::Arc};
 
 use arrow::array::make_comparator;
-use arrow_array::{Array, UInt64Array};
+use arrow_array::{Array, StructArray, UInt64Array};
 use arrow_schema::{DataType, Field, FieldRef, Schema, SortOptions};
 use arrow_select::concat::concat;
 use bytes::{Bytes, BytesMut};
@@ -208,6 +208,14 @@ async fn test_decode(
             let expected_size = (batch_size as usize).min(expected.len() - offset);
             let expected = expected.slice(offset, expected_size);
             assert_eq!(expected.data_type(), actual.data_type());
+            if expected.len() != actual.len() {
+                panic!(
+                    "Mismatch in length (at offset={}) expected {} but got {}",
+                    offset,
+                    expected.len(),
+                    actual.len()
+                );
+            }
             if &expected != actual {
                 if let Ok(comparator) = make_comparator(&expected, &actual, SortOptions::default())
                 {
@@ -216,8 +224,9 @@ async fn test_decode(
                     for i in 0..expected.len() {
                         if !matches!(comparator(i, i), Ordering::Equal) {
                             panic!(
-                            "Mismatch at index {} expected {:?} but got {:?} first mismatch is expected {:?} but got {:?}",
+                            "Mismatch at index {} (offset={}) expected {:?} but got {:?} first mismatch is expected {:?} but got {:?}",
                             i,
+                            offset,
                             expected,
                             actual,
                             expected.slice(i, 1),
@@ -464,7 +473,11 @@ impl SimulatedWriter {
         let page_encoding = encoded_page.description;
         let buffer_offsets_and_sizes = page_buffers
             .into_iter()
-            .map(|b| self.write_buffer(b))
+            .map(|b| {
+                let (offset, size) = self.write_buffer(b);
+                trace!("Encoded buffer offset={} size={}", offset, size);
+                (offset, size)
+            })
             .collect::<Vec<_>>();
 
         let page_info = PageInfo {
@@ -496,8 +509,15 @@ async fn check_round_trip_encoding_inner(
     for arr in &data {
         let mut external_buffers = writer.new_external_buffers();
         let repdef = RepDefBuilder::default();
+        let num_rows = arr.len() as u64;
         let encode_tasks = encoder
-            .maybe_encode(arr.clone(), &mut external_buffers, repdef, row_number)
+            .maybe_encode(
+                arr.clone(),
+                &mut external_buffers,
+                repdef,
+                row_number,
+                num_rows,
+            )
             .unwrap();
         for buffer in external_buffers.take_buffers() {
             writer.write_lance_buffer(buffer);
@@ -631,9 +651,23 @@ async fn check_round_trip_encoding_inner(
         }
         let num_rows = indices.len() as u64;
         let indices_arr = UInt64Array::from(indices.clone());
-        let expected = concat_data
-            .as_ref()
-            .map(|concat_data| arrow_select::take::take(&concat_data, &indices_arr, None).unwrap());
+
+        // There is a bug in arrow_select::take::take that causes it to return empty arrays
+        // if the data type is an empty struct.  This is a workaround for that.
+        let is_empty_struct = if let DataType::Struct(fields) = field.data_type() {
+            fields.is_empty()
+        } else {
+            false
+        };
+
+        let expected = if is_empty_struct {
+            Some(Arc::new(StructArray::new_empty_fields(indices_arr.len(), None)) as Arc<dyn Array>)
+        } else {
+            concat_data.as_ref().map(|concat_data| {
+                arrow_select::take::take(&concat_data, &indices_arr, None).unwrap()
+            })
+        };
+
         let scheduler = scheduler.clone();
         let indices = indices.clone();
         test_decode(

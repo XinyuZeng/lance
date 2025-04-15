@@ -11,14 +11,15 @@ use arrow_array::{cast::AsArray, Array, FixedSizeListArray, UInt8Array};
 use arrow_array::{ArrayRef, Float32Array, PrimitiveArray};
 use arrow_schema::DataType;
 use deepsize::DeepSizeOf;
-use distance::{build_distance_table_dot, compute_dot_distance};
+use distance::build_distance_table_dot;
 use lance_arrow::*;
 use lance_core::{Error, Result};
 use lance_linalg::distance::{DistanceType, Dot, L2};
 use lance_linalg::kmeans::compute_partition;
+use lance_table::utils::LanceIteratorExtension;
 use num_traits::Float;
 use prost::Message;
-use snafu::{location, Location};
+use snafu::location;
 use storage::{ProductQuantizationMetadata, ProductQuantizationStorage, PQ_METADATA_KEY};
 use tracing::instrument;
 
@@ -28,7 +29,7 @@ pub mod storage;
 pub mod transform;
 pub(crate) mod utils;
 
-use self::distance::{build_distance_table_l2, compute_l2_distance};
+use self::distance::{build_distance_table_l2, compute_pq_distance};
 pub use self::utils::num_centroids;
 use super::quantizer::{
     Quantization, QuantizationMetadata, QuantizationType, Quantizer, QuantizerBuildParams,
@@ -143,6 +144,7 @@ impl ProductQuantizer {
 
         let flatten_data = fsl.values().as_primitive::<T>();
         let sub_dim = dim / num_sub_vectors;
+        let total_code_length = fsl.len() * num_sub_vectors / (8 / NUM_BITS as usize);
         let values = flatten_data
             .values()
             .chunks_exact(dim)
@@ -169,6 +171,7 @@ impl ProductQuantizer {
                     sub_vec_code
                 }
             })
+            .exact_size(total_code_length)
             .collect::<Vec<_>>();
 
         let num_sub_vectors_in_byte = if NUM_BITS == 4 {
@@ -267,12 +270,16 @@ impl ProductQuantizer {
             key.values(),
         );
 
-        let distances = compute_dot_distance(
+        let distances = compute_pq_distance(
             &distance_table,
             self.num_bits,
             self.num_sub_vectors,
             code.values(),
+            0,
         );
+
+        let diff = self.num_sub_vectors as f32 - 1.0;
+        let distances = distances.into_iter().map(|d| d - diff).collect::<Vec<_>>();
         Ok(distances.into())
     }
 
@@ -327,11 +334,12 @@ impl ProductQuantizer {
     ///  The squared L2 distance.
     #[inline]
     fn compute_l2_distance(&self, distance_table: &[f32], code: &[u8]) -> Float32Array {
-        Float32Array::from(compute_l2_distance(
+        Float32Array::from(compute_pq_distance(
             distance_table,
             self.num_bits,
             self.num_sub_vectors,
             code,
+            100,
         ))
     }
 
@@ -392,6 +400,18 @@ impl Quantization for ProductQuantizer {
         params.build(data, distance_type)
     }
 
+    fn retrain(&mut self, data: &dyn Array) -> Result<()> {
+        assert_eq!(data.null_count(), 0);
+        let params = PQBuildParams::with_codebook(
+            self.num_sub_vectors,
+            self.num_bits as usize,
+            Arc::new(self.codebook.clone()),
+        );
+
+        *self = params.build(data, self.distance_type)?;
+        Ok(())
+    }
+
     fn code_dim(&self) -> usize {
         self.num_sub_vectors
     }
@@ -444,7 +464,7 @@ impl Quantization for ProductQuantizer {
         let tensor = pb::Tensor::try_from(&self.codebook)?;
         Ok(serde_json::to_value(ProductQuantizationMetadata {
             codebook_position,
-            num_bits: self.num_bits,
+            nbits: self.num_bits,
             num_sub_vectors: self.num_sub_vectors,
             dimension: self.dimension,
             codebook: None,
@@ -454,6 +474,10 @@ impl Quantization for ProductQuantizer {
     }
 
     fn from_metadata(metadata: &Self::Metadata, distance_type: DistanceType) -> Result<Quantizer> {
+        let distance_type = match distance_type {
+            DistanceType::Cosine => DistanceType::L2,
+            _ => distance_type,
+        };
         let codebook = match metadata.codebook.as_ref() {
             Some(fsl) => fsl.clone(),
             None => {
@@ -463,7 +487,7 @@ impl Quantization for ProductQuantizer {
         };
         Ok(Quantizer::Product(Self::new(
             metadata.num_sub_vectors,
-            metadata.num_bits,
+            metadata.nbits,
             metadata.dimension,
             codebook,
             distance_type,

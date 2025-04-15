@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::cmp::min;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -11,8 +12,8 @@ use arrow::array::{
 use arrow::buffer::ScalarBuffer;
 use arrow::datatypes::{self, Float32Type, Int32Type, UInt64Type};
 use arrow_array::{
-    Array, ArrayRef, Float32Array, ListArray, OffsetSizeTrait, PrimitiveArray, RecordBatch,
-    UInt32Array, UInt64Array,
+    Array, ArrayRef, BooleanArray, Float32Array, ListArray, OffsetSizeTrait, PrimitiveArray,
+    RecordBatch, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
@@ -20,25 +21,27 @@ use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_common::DataFusionError;
 use deepsize::DeepSizeOf;
+use fst::{IntoStreamer, Streamer};
 use futures::stream::repeat_with;
 use futures::{stream, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_arrow::{iter_str_array, RecordBatchExt};
-use lance_core::utils::mask::RowIdTreeMap;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
+use lance_core::utils::tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS};
 use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
 use lazy_static::lazy_static;
 use moka::future::Cache;
 use roaring::RoaringBitmap;
-use snafu::{location, Location};
-use tracing::instrument;
+use snafu::location;
+use tracing::{info, instrument};
 
 use super::builder::inverted_list_schema;
+use super::query::*;
 use super::{wand::*, InvertedIndexBuilder, TokenizerConfig};
-use crate::prefilter::{NoFilter, PreFilter};
+use crate::prefilter::PreFilter;
 use crate::scalar::{
-    AnyQuery, FullTextSearchQuery, IndexReader, IndexStore, InvertedIndexParams, SargableQuery,
-    ScalarIndex,
+    AnyQuery, IndexReader, IndexStore, InvertedIndexParams, MetricsCollector, SargableQuery,
+    ScalarIndex, SearchResult,
 };
 use crate::Index;
 
@@ -63,7 +66,7 @@ pub const K1: f32 = 1.2;
 pub const B: f32 = 0.75;
 
 lazy_static! {
-    static ref CACHE_SIZE: usize = std::env::var("LANCE_INVERTED_CACHE_SIZE")
+    pub static ref CACHE_SIZE: usize = std::env::var("LANCE_INVERTED_CACHE_SIZE")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(512 * 1024 * 1024);
@@ -107,55 +110,81 @@ impl InvertedIndex {
             .collect()
     }
 
-    #[instrument(level = "debug", skip_all)]
-    pub async fn full_text_search(
+    fn to_builder(&self) -> InvertedIndexBuilder {
+        let tokens = self.tokens.clone().into_mut();
+        let inverted_list = self.inverted_list.clone();
+        let docs = self.docs.clone();
+        InvertedIndexBuilder::from_existing_index(self.params.clone(), tokens, inverted_list, docs)
+    }
+
+    pub fn tokenizer(&self) -> tantivy::tokenizer::TextAnalyzer {
+        self.tokenizer.clone()
+    }
+
+    pub fn expand_fuzzy(
         &self,
-        query: &FullTextSearchQuery,
-        prefilter: Arc<dyn PreFilter>,
-    ) -> Result<Vec<(u64, f32)>> {
-        let mut tokenizer = self.tokenizer.clone();
-        let tokens = collect_tokens(&query.query, &mut tokenizer, None);
-        let token_ids = self.map(&tokens).into_iter();
-        let token_ids = if !is_phrase_query(&query.query) {
-            token_ids.sorted_unstable().dedup().collect()
-        } else {
-            if !self.inverted_list.has_positions() {
-                return Err(Error::Index { message: "position is not found but required for phrase queries, try recreating the index with position".to_owned(), location: location!() });
+        tokens: Vec<String>,
+        fuzziness: Option<u32>,
+        max_expansions: usize,
+    ) -> Result<Vec<String>> {
+        let mut new_tokens = Vec::with_capacity(min(tokens.len(), max_expansions));
+        for token in tokens {
+            let fuzziness = match fuzziness {
+                Some(fuzziness) => fuzziness,
+                None => MatchQuery::auto_fuzziness(&token),
+            };
+            let lev =
+                fst::automaton::Levenshtein::new(&token, fuzziness).map_err(|e| Error::Index {
+                    message: format!("failed to construct the fuzzy query: {}", e),
+                    location: location!(),
+                })?;
+            if let TokenMap::Fst(ref map) = self.tokens.tokens {
+                let mut stream = map.search(lev).into_stream();
+                while let Some((token, _)) = stream.next() {
+                    new_tokens.push(String::from_utf8_lossy(token).into_owned());
+                    if new_tokens.len() >= max_expansions {
+                        break;
+                    }
+                }
+            } else {
+                return Err(Error::Index {
+                    message: "tokens is not fst, which is not expected".to_owned(),
+                    location: location!(),
+                });
             }
-            let token_ids = token_ids.collect::<Vec<_>>();
-            // for phrase query, all tokens must be present
-            if token_ids.len() != tokens.len() {
-                return Ok(Vec::new());
-            }
-            token_ids
-        };
-        self.bm25_search(token_ids, query, prefilter).await
+        }
+        Ok(new_tokens)
     }
 
     // search the documents that contain the query
     // return the row ids of the documents sorted by bm25 score
     // ref: https://en.wikipedia.org/wiki/Okapi_BM25
     #[instrument(level = "debug", skip_all)]
-    async fn bm25_search(
+    pub async fn bm25_search(
         &self,
-        token_ids: Vec<u32>,
-        query: &FullTextSearchQuery,
+        tokens: &[String],
+        params: &FtsSearchParams,
+        is_phrase_query: bool,
         prefilter: Arc<dyn PreFilter>,
-    ) -> Result<Vec<(u64, f32)>> {
-        let limit = query
-            .limit
-            .map(|limit| limit as usize)
-            .unwrap_or(usize::MAX);
-        let wand_factor = query.wand_factor.unwrap_or(1.0);
+        metrics: &dyn MetricsCollector,
+    ) -> Result<(Vec<u64>, Vec<f32>)> {
+        metrics.record_comparisons(tokens.len());
 
         let mask = prefilter.mask();
-        let is_phrase_query = is_phrase_query(&query.query);
+        let token_ids = self.map(tokens);
+        if token_ids.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        if is_phrase_query && token_ids.len() != tokens.len() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+
         let postings = stream::iter(token_ids)
             .enumerate()
             .zip(repeat_with(|| (self.inverted_list.clone(), mask.clone())))
             .map(|((position, token_id), (inverted_list, mask))| async move {
                 let posting = inverted_list
-                    .posting_list(token_id, is_phrase_query)
+                    .posting_list(token_id, is_phrase_query, metrics)
                     .await?;
                 Result::Ok(PostingIterator::new(
                     token_id,
@@ -171,19 +200,17 @@ impl InvertedIndex {
             .await?;
 
         let mut wand = Wand::new(self.docs.len(), postings.into_iter());
-        wand.search(is_phrase_query, limit, wand_factor, |doc, freq| {
-            let doc_norm =
-                K1 * (1.0 - B + B * self.docs.num_tokens(doc) as f32 / self.docs.average_length());
-            freq / (freq + doc_norm)
-        })
+        wand.search(
+            is_phrase_query,
+            params.limit.unwrap_or(usize::MAX),
+            params.wand_factor,
+            |doc, freq| {
+                let doc_norm = K1
+                    * (1.0 - B + B * self.docs.num_tokens(doc) as f32 / self.docs.average_length());
+                freq / (freq + doc_norm)
+            },
+        )
         .await
-    }
-
-    fn to_builder(&self) -> InvertedIndexBuilder {
-        let tokens = self.tokens.clone();
-        let inverted_list = self.inverted_list.clone();
-        let docs = self.docs.clone();
-        InvertedIndexBuilder::from_existing_index(self.params.clone(), tokens, inverted_list, docs)
     }
 }
 
@@ -224,23 +251,20 @@ impl Index for InvertedIndex {
 impl ScalarIndex for InvertedIndex {
     // return the row ids of the documents that contain the query
     #[instrument(level = "debug", skip_all)]
-    async fn search(&self, query: &dyn AnyQuery) -> Result<RowIdTreeMap> {
+    async fn search(
+        &self,
+        query: &dyn AnyQuery,
+        _metrics: &dyn MetricsCollector,
+    ) -> Result<SearchResult> {
         let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
-        let row_ids = match query {
-            SargableQuery::FullTextSearch(query) => self
-                .full_text_search(query, Arc::new(NoFilter))
-                .await?
-                .into_iter()
-                .map(|(row_id, _)| row_id),
-            query => {
-                return Err(Error::invalid_input(
-                    format!("unsupported query {:?} for inverted index", query),
-                    location!(),
-                ))
-            }
-        };
+        return Err(Error::invalid_input(
+            format!("unsupported query {:?} for inverted index", query),
+            location!(),
+        ));
+    }
 
-        Ok(RowIdTreeMap::from_iter(row_ids))
+    fn can_answer_exact(&self, _: &dyn AnyQuery) -> bool {
+        true
     }
 
     async fn load(store: Arc<dyn IndexStore>) -> Result<Arc<Self>>
@@ -314,24 +338,93 @@ impl ScalarIndex for InvertedIndex {
     }
 }
 
+// at indexing, we use HashMap because we need it to be mutable,
+// at searching, we use fst::Map because it's more efficient
+#[derive(Debug, Clone)]
+pub enum TokenMap {
+    HashMap(HashMap<String, u32>),
+    Fst(fst::Map<Vec<u8>>),
+}
+
+impl Default for TokenMap {
+    fn default() -> Self {
+        Self::HashMap(HashMap::new())
+    }
+}
+
+impl DeepSizeOf for TokenMap {
+    fn deep_size_of_children(&self, ctx: &mut deepsize::Context) -> usize {
+        match self {
+            Self::HashMap(map) => map.deep_size_of_children(ctx),
+            Self::Fst(map) => map.as_fst().size(),
+        }
+    }
+}
+
+impl TokenMap {
+    pub fn len(&self) -> usize {
+        match self {
+            Self::HashMap(map) => map.len(),
+            Self::Fst(map) => map.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 // TokenSet is a mapping from tokens to token ids
-// it also records the frequency of each token
 #[derive(Debug, Clone, Default, DeepSizeOf)]
 pub struct TokenSet {
-    // token -> (token_id, frequency)
-    pub(crate) tokens: HashMap<String, u32>,
+    // token -> token_id
+    pub(crate) tokens: TokenMap,
     pub(crate) next_id: u32,
     total_length: usize,
 }
 
 impl TokenSet {
+    pub fn into_mut(self) -> Self {
+        let tokens = match self.tokens {
+            TokenMap::HashMap(map) => map,
+            TokenMap::Fst(map) => {
+                let mut new_map = HashMap::with_capacity(map.len());
+                let mut stream = map.into_stream();
+                while let Some((token, token_id)) = stream.next() {
+                    new_map.insert(String::from_utf8_lossy(token).into_owned(), token_id as u32);
+                }
+
+                new_map
+            }
+        };
+
+        Self {
+            tokens: TokenMap::HashMap(tokens),
+            next_id: self.next_id,
+            total_length: self.total_length,
+        }
+    }
+
+    pub fn num_tokens(&self) -> usize {
+        self.tokens.len()
+    }
+
     pub fn to_batch(self) -> Result<RecordBatch> {
         let mut token_builder = StringBuilder::with_capacity(self.tokens.len(), self.total_length);
         let mut token_id_builder = UInt32Builder::with_capacity(self.tokens.len());
-        for (token, token_id) in self.tokens.into_iter().sorted_unstable() {
-            token_builder.append_value(token);
-            token_id_builder.append_value(token_id);
+
+        if let TokenMap::HashMap(map) = self.tokens {
+            for (token, token_id) in map.into_iter().sorted_unstable() {
+                token_builder.append_value(&token);
+                token_id_builder.append_value(token_id);
+            }
+        } else {
+            return Err(Error::Index {
+                message: "tokens is not a HashMap".to_owned(),
+                location: location!(),
+            });
         }
+
         let token_col = token_builder.finish();
         let token_id_col = token_id_builder.finish();
 
@@ -353,21 +446,29 @@ impl TokenSet {
     pub async fn load(reader: Arc<dyn IndexReader>) -> Result<Self> {
         let mut next_id = 0;
         let mut total_length = 0;
-        let mut tokens = HashMap::new();
+        let mut tokens = fst::MapBuilder::memory();
 
         let batch = reader.read_range(0..reader.num_rows(), None).await?;
         let token_col = batch[TOKEN_COL].as_string::<i32>();
         let token_id_col = batch[TOKEN_ID_COL].as_primitive::<datatypes::UInt32Type>();
 
         for (token, &token_id) in token_col.iter().zip(token_id_col.values().iter()) {
-            let token = token.unwrap();
+            let token = token.ok_or(Error::Index {
+                message: "found null token in token set".to_owned(),
+                location: location!(),
+            })?;
             next_id = next_id.max(token_id + 1);
             total_length += token.len();
-            tokens.insert(token.to_owned(), token_id);
+            tokens
+                .insert(token, token_id as u64)
+                .map_err(|e| Error::Index {
+                    message: format!("failed to insert token {}: {}", token, e),
+                    location: location!(),
+                })?;
         }
 
         Ok(Self {
-            tokens,
+            tokens: TokenMap::Fst(tokens.into_map()),
             next_id,
             total_length,
         })
@@ -376,7 +477,10 @@ impl TokenSet {
     pub fn add(&mut self, token: String) -> u32 {
         let next_id = self.next_id();
         let len = token.len();
-        let token_id = *self.tokens.entry(token).or_insert(next_id);
+        let token_id = match self.tokens {
+            TokenMap::HashMap(ref mut map) => *map.entry(token).or_insert(next_id),
+            _ => unreachable!("tokens must be HashMap while indexing"),
+        };
 
         // add token if it doesn't exist
         if token_id == next_id {
@@ -388,7 +492,10 @@ impl TokenSet {
     }
 
     pub fn get(&self, token: &str) -> Option<u32> {
-        self.tokens.get(token).copied()
+        match self.tokens {
+            TokenMap::HashMap(ref map) => map.get(token).copied(),
+            TokenMap::Fst(ref map) => map.get(token).map(|id| id as u32),
+        }
     }
 
     pub fn next_id(&self) -> u32 {
@@ -493,15 +600,18 @@ impl InvertedListReader {
         Ok(batch)
     }
 
-    #[instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self, metrics))]
     pub(crate) async fn posting_list(
         &self,
         token_id: u32,
         is_phrase_query: bool,
+        metrics: &dyn MetricsCollector,
     ) -> Result<PostingList> {
         let mut posting = self
             .posting_cache
             .try_get_with(token_id, async move {
+                metrics.record_part_load();
+                info!(target: TRACE_IO_EVENTS, type=IO_TYPE_LOAD_SCALAR_PART, index_type="inverted", part_id=token_id);
                 let batch = self.posting_batch(token_id, false).await?;
                 let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().clone();
                 let frequencies = batch[FREQUENCY_COL].as_primitive::<Float32Type>().clone();
@@ -533,10 +643,16 @@ impl InvertedListReader {
             let batch = self
                 .reader
                 .read_range(offset..offset + length, Some(&[POSITION_COL]))
-                .await?;
-            Result::Ok(batch
-                .column_by_name(POSITION_COL)
-                .ok_or(Error::Index { message: "position is not found but required for phrase queries, try recreating the index with position".to_owned(), location: location!() })?
+                .await.map_err(|e| {
+                    match e {
+                        Error::Schema { .. } => Error::Index {
+                            message: "position is not found but required for phrase queries, try recreating the index with position".to_owned(), 
+                            location: location!(),
+                        },
+                        e => e
+                    }
+                })?;
+            Result::Ok(batch[POSITION_COL]
                 .as_list::<i32>()
                 .clone())
         }).await.map_err(|e| Error::io(e.to_string(), location!()))
@@ -1063,19 +1179,19 @@ pub fn flat_bm25_search(
 
     let score_col = Arc::new(Float32Array::from(scores)) as ArrayRef;
     let batch = batch
-        .drop_column(doc_col)?
-        .try_with_column(SCORE_FIELD.clone(), score_col)?;
+        .try_with_column(SCORE_FIELD.clone(), score_col)?
+        .project_by_schema(&FTS_SCHEMA)?; // the scan node would probably scan some extra columns for prefilter, drop them here
     Ok(batch)
 }
 
 pub fn flat_bm25_search_stream(
     input: SendableRecordBatchStream,
     doc_col: String,
-    query: FullTextSearchQuery,
+    query: String,
     index: &InvertedIndex,
 ) -> SendableRecordBatchStream {
     let mut tokenizer = index.tokenizer.clone();
-    let query_token_ids = collect_tokens(&query.query, &mut tokenizer, None)
+    let query_token_ids = collect_tokens(&query, &mut tokenizer, None)
         .into_iter()
         .dedup()
         .map(|token| {
@@ -1090,7 +1206,7 @@ pub fn flat_bm25_search_stream(
 
     let stream = input.map(move |batch| {
         let batch = batch?;
-        flat_bm25_search(
+        let scored_batch = flat_bm25_search(
             batch,
             &doc_col,
             inverted_list.as_ref(),
@@ -1099,28 +1215,20 @@ pub fn flat_bm25_search_stream(
             &mut tokenizer,
             avgdl,
             num_docs,
-        )
+        )?;
+
+        // filter out rows with score 0
+        let score_col = scored_batch[SCORE_COL].as_primitive::<Float32Type>();
+        let mask = score_col
+            .iter()
+            .map(|score| score.is_some_and(|score| score > 0.0))
+            .collect::<Vec<_>>();
+        let mask = BooleanArray::from(mask);
+        let batch = arrow::compute::filter_record_batch(&scored_batch, &mask)?;
+        Ok(batch)
     });
 
     Box::pin(RecordBatchStreamAdapter::new(FTS_SCHEMA.clone(), stream)) as SendableRecordBatchStream
-}
-
-pub fn collect_tokens(
-    text: &str,
-    tokenizer: &mut tantivy::tokenizer::TextAnalyzer,
-    inclusive: Option<&HashSet<String>>,
-) -> Vec<String> {
-    let mut stream = tokenizer.token_stream(text);
-    let mut tokens = Vec::new();
-    while let Some(token) = stream.next() {
-        if let Some(inclusive) = inclusive {
-            if !inclusive.contains(&token.text) {
-                continue;
-            }
-        }
-        tokens.push(token.text.to_owned());
-    }
-    tokens
 }
 
 pub fn is_phrase_query(query: &str) -> bool {

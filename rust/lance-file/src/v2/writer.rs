@@ -4,6 +4,7 @@
 use core::panic;
 use std::cmp::max;
 use std::collections::HashMap;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
@@ -22,12 +23,14 @@ use lance_encoding::encoder::{
 };
 use lance_encoding::repdef::RepDefBuilder;
 use lance_encoding::version::LanceFileVersion;
+use lance_io::object_store::ObjectStore;
 use lance_io::object_writer::ObjectWriter;
 use lance_io::traits::Writer;
-use log::debug;
+use log::{debug, warn};
+use object_store::path::Path;
 use prost::Message;
 use prost_types::Any;
-use snafu::{location, Location};
+use snafu::location;
 use tokio::io::AsyncWriteExt;
 use tracing::instrument;
 
@@ -114,6 +117,8 @@ fn initial_column_metadata() -> pbfile::ColumnMetadata {
     }
 }
 
+static WARNED_ON_UNSTABLE_API: AtomicBool = AtomicBool::new(false);
+
 impl FileWriter {
     pub fn max_mem_bytes(&self) -> u64 {
         self.max_mem_bytes
@@ -135,6 +140,20 @@ impl FileWriter {
     /// The output schema will be set based on the first batch of data to arrive.
     /// If no data arrives and the writer is finished then the write will fail.
     pub fn new_lazy(object_writer: ObjectWriter, options: FileWriterOptions) -> Self {
+        if let Some(format_version) = options.format_version {
+            if format_version > LanceFileVersion::Stable
+                && WARNED_ON_UNSTABLE_API
+                    .compare_exchange(
+                        false,
+                        true,
+                        std::sync::atomic::Ordering::Relaxed,
+                        std::sync::atomic::Ordering::Relaxed,
+                    )
+                    .is_ok()
+            {
+                warn!("You have requested an unstable format version.  Files written with this format version may not be readable in the future!  This is a development feature and should only be used for experimentation and never for production data.");
+            }
+        }
         Self {
             writer: object_writer,
             schema: None,
@@ -148,6 +167,24 @@ impl FileWriter {
             options,
             max_mem_bytes: 0,
         }
+    }
+
+    /// Write a series of record batches to a new file
+    ///
+    /// Returns the number of rows written
+    pub async fn create_file_with_batches(
+        store: &ObjectStore,
+        path: &Path,
+        schema: lance_core::datatypes::Schema,
+        batches: impl Iterator<Item = RecordBatch> + Send,
+        options: FileWriterOptions,
+    ) -> Result<usize> {
+        let writer = store.create(path).await?;
+        let mut writer = Self::try_new(writer, schema, options)?;
+        for batch in batches {
+            writer.write_batch(&batch).await?;
+        }
+        Ok(writer.finish().await? as usize)
     }
 
     async fn do_write_buffer(writer: &mut ObjectWriter, buf: &[u8]) -> Result<()> {
@@ -318,11 +355,13 @@ impl FileWriter {
                         location: location!(),
                     })?;
                 let repdef = RepDefBuilder::default();
+                let num_rows = array.len() as u64;
                 let res = column_writer.maybe_encode(
                     array.clone(),
                     external_buffers,
                     repdef,
                     self.rows_written,
+                    num_rows,
                 );
                 max_cur += column_writer.current_bytes();
                 res

@@ -11,7 +11,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package com.lancedb.lance.spark;
 
 import com.lancedb.lance.ReadOptions;
@@ -23,9 +22,11 @@ import java.util.Map;
 public class SparkOptions {
   private static final String ak = "access_key_id";
   private static final String sk = "secret_access_key";
-  private static final String endpoint = "aws_region";
-  private static final String region = "aws_endpoint";
+  private static final String endpoint = "aws_endpoint";
+  private static final String region = "aws_region";
   private static final String virtual_hosted_style = "virtual_hosted_style_request";
+  private static final String allow_http = "allow_http";
+
   private static final String block_size = "block_size";
   private static final String version = "version";
   private static final String index_cache_size = "index_cache_size";
@@ -34,6 +35,8 @@ public class SparkOptions {
   private static final String max_row_per_file = "max_row_per_file";
   private static final String max_rows_per_group = "max_rows_per_group";
   private static final String max_bytes_per_file = "max_bytes_per_file";
+  private static final String batch_size = "batch_size";
+  private static final String topN_push_down = "topN_push_down";
 
   public static ReadOptions genReadOptionFromConfig(LanceConfig config) {
     ReadOptions.Builder builder = new ReadOptions.Builder();
@@ -80,9 +83,32 @@ public class SparkOptions {
       storageOptions.put(ak, maps.get(ak));
       storageOptions.put(sk, maps.get(sk));
       storageOptions.put(endpoint, maps.get(endpoint));
+    }
+    if (maps.containsKey(region)) {
       storageOptions.put(region, maps.get(region));
+    }
+    if (maps.containsKey(virtual_hosted_style)) {
       storageOptions.put(virtual_hosted_style, maps.get(virtual_hosted_style));
     }
+    if (maps.containsKey(allow_http)) {
+      storageOptions.put(allow_http, maps.get(allow_http));
+    }
     return storageOptions;
+  }
+
+  public static int getBatchSize(LanceConfig config) {
+    Map<String, String> options = config.getOptions();
+    if (options.containsKey(batch_size)) {
+      return Integer.parseInt(options.get(batch_size));
+    }
+    return 512;
+  }
+
+  public static boolean enableTopNPushDown(LanceConfig config) {
+    return Boolean.parseBoolean(config.getOptions().getOrDefault(topN_push_down, "true"));
+  }
+
+  public static boolean overwrite(LanceConfig config) {
+    return config.getOptions().getOrDefault(write_mode, "append").equalsIgnoreCase("overwrite");
   }
 }

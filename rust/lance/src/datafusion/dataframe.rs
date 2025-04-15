@@ -9,9 +9,9 @@ use std::{
 use arrow_schema::{Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::{
-    catalog::Session,
+    catalog::{streaming::StreamingTable, Session},
     dataframe::DataFrame,
-    datasource::{streaming::StreamingTable, TableProvider},
+    datasource::TableProvider,
     error::DataFusionError,
     execution::{context::SessionContext, TaskContext},
     logical_expr::{Expr, TableProviderFilterPushDown, TableType},
@@ -22,6 +22,7 @@ use lance_core::{ROW_ADDR_FIELD, ROW_ID_FIELD};
 
 use crate::Dataset;
 
+#[derive(Debug)]
 pub struct LanceTableProvider {
     dataset: Arc<Dataset>,
     full_schema: Arc<Schema>,
@@ -150,6 +151,14 @@ impl OneShotPartitionStream {
             data: Arc::new(Mutex::new(Some(data))),
             schema,
         }
+    }
+}
+
+impl std::fmt::Debug for OneShotPartitionStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OneShotPartitionStream")
+            .field("schema", &self.schema)
+            .finish()
     }
 }
 

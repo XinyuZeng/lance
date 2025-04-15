@@ -6,7 +6,10 @@ use std::sync::Arc;
 use arrow_array::RecordBatch;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::{StreamExt, TryStreamExt};
-use lance_core::datatypes::{NullabilityComparison, SchemaCompareOptions, StorageClass};
+use lance_core::datatypes::{
+    NullabilityComparison, OnMissing, OnTypeMismatch, SchemaCompareOptions, StorageClass,
+};
+use lance_core::utils::tracing::{AUDIT_MODE_CREATE, AUDIT_TYPE_DATA, TRACE_FILE_AUDIT};
 use lance_core::{datatypes::Schema, Error, Result};
 use lance_datafusion::chunker::{break_stream, chunk_stream};
 use lance_datafusion::utils::StreamingWriteSource;
@@ -19,8 +22,8 @@ use lance_table::format::{DataFile, Fragment};
 use lance_table::io::commit::{commit_handler_from_url, CommitHandler};
 use lance_table::io::manifest::ManifestDescribing;
 use object_store::path::Path;
-use snafu::{location, Location};
-use tracing::instrument;
+use snafu::location;
+use tracing::{info, instrument};
 use uuid::Uuid;
 
 use crate::session::Session;
@@ -270,6 +273,7 @@ pub async fn do_write_fragments(
             || writer.as_mut().unwrap().tell().await? >= params.max_bytes_per_file as u64
         {
             let (num_rows, data_file) = writer.take().unwrap().finish().await?;
+            info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, type=AUDIT_TYPE_DATA, path = &data_file.path);
             debug_assert_eq!(num_rows, num_rows_in_current_file);
             params.progress.complete(fragments.last().unwrap()).await?;
             let last_fragment = fragments.last_mut().unwrap();
@@ -282,6 +286,7 @@ pub async fn do_write_fragments(
     // Complete the final writer
     if let Some(mut writer) = writer.take() {
         let (num_rows, data_file) = writer.finish().await?;
+        info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, type=AUDIT_TYPE_DATA, path = &data_file.path);
         let last_fragment = fragments.last_mut().unwrap();
         last_fragment.physical_rows = Some(num_rows as usize);
         last_fragment.files.push(data_file);
@@ -335,7 +340,11 @@ pub async fn write_fragments_internal(
                     },
                 )?;
                 // Project from the dataset schema, because it has the correct field ids.
-                let write_schema = dataset.schema().project_by_schema(&schema)?;
+                let write_schema = dataset.schema().project_by_schema(
+                    &schema,
+                    OnMissing::Error,
+                    OnTypeMismatch::Error,
+                )?;
                 // Use the storage version from the dataset, ignoring any version from the user.
                 let data_storage_version = dataset
                     .manifest()
@@ -362,7 +371,11 @@ pub async fn write_fragments_internal(
         (schema, params.storage_version_or_default())
     };
 
-    let data_schema = schema.project_by_schema(data.schema().as_ref())?;
+    let data_schema = schema.project_by_schema(
+        data.schema().as_ref(),
+        OnMissing::Error,
+        OnTypeMismatch::Error,
+    )?;
 
     let (data, blob_data) = data.extract_blob_stream(&data_schema);
 

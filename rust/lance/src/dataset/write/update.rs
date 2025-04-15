@@ -22,10 +22,9 @@ use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_datafusion::expr::safe_coerce_scalar;
 use lance_table::format::Fragment;
 use roaring::RoaringTreemap;
-use snafu::{location, Location, ResultExt};
+use snafu::{location, ResultExt};
 
 use crate::dataset::transaction::{Operation, Transaction};
-use crate::io::commit::commit_transaction;
 use crate::{io::exec::Planner, Dataset};
 use crate::{Error, Result};
 
@@ -69,13 +68,14 @@ impl UpdateBuilder {
         let expr = planner
             .parse_filter(filter)
             .map_err(box_error)
-            .context(InvalidInputSnafu)?;
-        self.condition = Some(
-            planner
-                .optimize_expr(expr)
-                .map_err(box_error)
-                .context(InvalidInputSnafu)?,
-        );
+            .context(InvalidInputSnafu {
+                location: location!(),
+            })?;
+        self.condition = Some(planner.optimize_expr(expr).map_err(box_error).context(
+            InvalidInputSnafu {
+                location: location!(),
+            },
+        )?);
         Ok(self)
     }
 
@@ -113,7 +113,9 @@ impl UpdateBuilder {
         let mut expr = planner
             .parse_expr(value)
             .map_err(box_error)
-            .context(InvalidInputSnafu)?;
+            .context(InvalidInputSnafu {
+                location: location!(),
+            })?;
 
         // Cast expression to the column's data type if necessary.
         let dest_type = field.data_type();
@@ -121,7 +123,9 @@ impl UpdateBuilder {
         let src_type = expr
             .get_type(&df_schema)
             .map_err(box_error)
-            .context(InvalidInputSnafu)?;
+            .context(InvalidInputSnafu {
+                location: location!(),
+            })?;
         if dest_type != src_type {
             expr = match expr {
                 // TODO: remove this branch once DataFusion supports casting List to FSL
@@ -140,7 +144,9 @@ impl UpdateBuilder {
                 _ => expr
                     .cast_to(&dest_type, &df_schema)
                     .map_err(box_error)
-                    .context(InvalidInputSnafu)?,
+                    .context(InvalidInputSnafu {
+                        location: location!(),
+                    })?,
             };
         }
 
@@ -150,7 +156,9 @@ impl UpdateBuilder {
         let expr = planner
             .optimize_expr(expr)
             .map_err(box_error)
-            .context(InvalidInputSnafu)?;
+            .context(InvalidInputSnafu {
+                location: location!(),
+            })?;
 
         self.updates.insert(column.as_ref().to_string(), expr);
         Ok(self)
@@ -373,20 +381,10 @@ impl UpdateJob {
             None,
         );
 
-        let (manifest, manifest_path) = commit_transaction(
-            self.dataset.as_ref(),
-            self.dataset.object_store(),
-            self.dataset.commit_handler.as_ref(),
-            &transaction,
-            &Default::default(),
-            &Default::default(),
-            self.dataset.manifest_naming_scheme,
-        )
-        .await?;
-
         let mut dataset = self.dataset.as_ref().clone();
-        dataset.manifest = Arc::new(manifest);
-        dataset.manifest_file = manifest_path;
+        dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await?;
 
         Ok(Arc::new(dataset))
     }

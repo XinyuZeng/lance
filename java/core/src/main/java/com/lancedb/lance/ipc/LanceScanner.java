@@ -11,7 +11,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package com.lancedb.lance.ipc;
 
 import com.lancedb.lance.Dataset;
@@ -70,7 +69,9 @@ public class LanceScanner implements org.apache.arrow.dataset.scanner.Scanner {
             options.getOffset(),
             options.getNearest(),
             options.isWithRowId(),
-            options.getBatchReadahead());
+            options.isWithRowAddress(),
+            options.getBatchReadahead(),
+            options.getColumnOrderings());
     scanner.allocator = allocator;
     scanner.dataset = dataset;
     scanner.options = options;
@@ -88,7 +89,9 @@ public class LanceScanner implements org.apache.arrow.dataset.scanner.Scanner {
       Optional<Long> offset,
       Optional<Query> query,
       boolean withRowId,
-      int batchReadahead);
+      boolean withRowAddress,
+      int batchReadahead,
+      Optional<List<ColumnOrdering>> columnOrderings);
 
   /**
    * Closes this scanner and releases any system resources associated with it. If the scanner is

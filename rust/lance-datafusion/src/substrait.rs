@@ -24,7 +24,7 @@ use datafusion_substrait::substrait::proto::{
 };
 use lance_core::{Error, Result};
 use prost::Message;
-use snafu::{location, Location};
+use snafu::location;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -50,8 +50,10 @@ pub fn encode_substrait(expr: Expr, schema: Arc<ArrowSchema>) -> Result<Vec<u8>>
 
     let session_context = SessionContext::new();
 
-    let substrait_plan =
-        datafusion_substrait::logical_plan::producer::to_substrait_plan(&plan, &session_context)?;
+    let substrait_plan = datafusion_substrait::logical_plan::producer::to_substrait_plan(
+        &plan,
+        &session_context.state(),
+    )?;
 
     if let Some(plan_rel::RelType::Root(root)) = &substrait_plan.relations[0].rel_type {
         if let Some(rel::RelType::Filter(filt)) = &root.input.as_ref().unwrap().rel_type {
@@ -359,9 +361,11 @@ pub async fn parse_substrait(expr: &[u8], input_schema: Arc<ArrowSchema>) -> Res
         },
         dummy_table,
     )?;
-    let df_plan =
-        datafusion_substrait::logical_plan::consumer::from_substrait_plan(&session_context, &plan)
-            .await?;
+    let df_plan = datafusion_substrait::logical_plan::consumer::from_substrait_plan(
+        &session_context.state(),
+        &plan,
+    )
+    .await?;
 
     let expr = df_plan.expressions().pop().unwrap();
 
@@ -378,6 +382,7 @@ pub async fn parse_substrait(expr: &[u8], input_schema: Arc<ArrowSchema>) -> Res
                             Ok(Transformed::yes(Expr::Column(Column {
                                 relation: None,
                                 name: column.name,
+                                spans: column.spans.clone(), // Preserve spans if available
                             })))
                         } else {
                             // This should not be possible
@@ -447,10 +452,7 @@ mod tests {
             .unwrap();
 
         let expected = Expr::BinaryExpr(BinaryExpr {
-            left: Box::new(Expr::Column(Column {
-                relation: None,
-                name: "x".to_string(),
-            })),
+            left: Box::new(Expr::Column(Column::new_unqualified("x"))),
             op: Operator::Lt,
             right: Box::new(Expr::Literal(ScalarValue::Int32(Some(0)))),
         });

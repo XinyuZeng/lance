@@ -35,10 +35,17 @@
 
 use chrono::{DateTime, TimeDelta, Utc};
 use futures::{stream, StreamExt, TryStreamExt};
-use lance_core::{Error, Result};
+use lance_core::{
+    utils::tracing::{
+        AUDIT_MODE_DELETE, AUDIT_MODE_DELETE_UNVERIFIED, AUDIT_TYPE_DATA, AUDIT_TYPE_DELETION,
+        AUDIT_TYPE_INDEX, AUDIT_TYPE_MANIFEST, TRACE_FILE_AUDIT,
+    },
+    Error, Result,
+};
 use lance_table::{
     format::{Index, Manifest},
     io::{
+        commit::ManifestLocation,
         deletion::deletion_file_path,
         manifest::{read_manifest, read_manifest_indexes},
     },
@@ -49,6 +56,7 @@ use std::{
     future,
     sync::{Mutex, MutexGuard},
 };
+use tracing::{info, instrument, Span};
 
 use crate::{utils::temporal::utc_now, Dataset};
 
@@ -143,6 +151,7 @@ impl<'a> CleanupTask<'a> {
         self.delete_unreferenced_files(inspection).await
     }
 
+    #[instrument(level = "debug", skip_all)]
     async fn process_manifests(
         &'a self,
         tagged_versions: &HashSet<u64>,
@@ -150,10 +159,10 @@ impl<'a> CleanupTask<'a> {
         let inspection = Mutex::new(CleanupInspection::default());
         self.dataset
             .commit_handler
-            .list_manifests(&self.dataset.base, &self.dataset.object_store.inner)
+            .list_manifest_locations(&self.dataset.base, &self.dataset.object_store.inner)
             .await?
-            .try_for_each_concurrent(self.dataset.object_store.io_parallelism(), |path| {
-                self.process_manifest_file(path, &inspection, tagged_versions)
+            .try_for_each_concurrent(self.dataset.object_store.io_parallelism(), |location| {
+                self.process_manifest_file(location, &inspection, tagged_versions)
             })
             .await?;
         Ok(inspection.into_inner().unwrap())
@@ -161,7 +170,7 @@ impl<'a> CleanupTask<'a> {
 
     async fn process_manifest_file(
         &self,
-        path: Path,
+        location: ManifestLocation,
         inspection: &Mutex<CleanupInspection>,
         tagged_versions: &HashSet<u64>,
     ) -> Result<()> {
@@ -171,7 +180,8 @@ impl<'a> CleanupTask<'a> {
         // ignore it then we might delete valid data files thinking they are not
         // referenced.
 
-        let manifest = read_manifest(&self.dataset.object_store, &path, None).await?;
+        let manifest =
+            read_manifest(&self.dataset.object_store, &location.path, location.size).await?;
         let dataset_version = self.dataset.version().version;
 
         // Don't delete the latest version, even if it is old. Don't delete tagged versions,
@@ -180,7 +190,8 @@ impl<'a> CleanupTask<'a> {
         let is_latest = dataset_version <= manifest.version;
         let is_tagged = tagged_versions.contains(&manifest.version);
         let in_working_set = is_latest || manifest.timestamp() >= self.before || is_tagged;
-        let indexes = read_manifest_indexes(&self.dataset.object_store, &path, &manifest).await?;
+        let indexes =
+            read_manifest_indexes(&self.dataset.object_store, &location.path, &manifest).await?;
 
         let mut inspection = inspection.lock().unwrap();
 
@@ -191,7 +202,7 @@ impl<'a> CleanupTask<'a> {
 
         self.process_manifest(&manifest, &indexes, in_working_set, &mut inspection)?;
         if !in_working_set {
-            inspection.old_manifests.push(path.clone());
+            inspection.old_manifests.push(location.path.clone());
         }
         Ok(())
     }
@@ -239,6 +250,7 @@ impl<'a> CleanupTask<'a> {
         Ok(())
     }
 
+    #[instrument(level = "debug", skip_all, fields(old_versions = inspection.old_manifests.len(), bytes_removed = tracing::field::Empty))]
     async fn delete_unreferenced_files(
         &self,
         inspection: CleanupInspection,
@@ -279,7 +291,12 @@ impl<'a> CleanupTask<'a> {
             .try_fold(0, |acc, size| async move { Ok(acc + (size as u64)) })
             .await;
 
-        let old_manifests_stream = stream::iter(old_manifests).map(Result::<Path>::Ok).boxed();
+        let old_manifests_stream = stream::iter(old_manifests)
+            .map(|path| {
+                info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE, type=AUDIT_TYPE_MANIFEST, path = path.to_string());
+                Ok(path)
+            })
+            .boxed();
         let all_paths_to_remove =
             stream::iter(vec![unreferenced_paths, old_manifests_stream]).flatten();
 
@@ -294,6 +311,10 @@ impl<'a> CleanupTask<'a> {
         let mut removal_stats = removal_stats.into_inner().unwrap();
         removal_stats.old_versions = num_old_manifests as u64;
         removal_stats.bytes_removed += manifest_bytes_removed?;
+
+        let span = Span::current();
+        span.record("bytes_removed", removal_stats.bytes_removed);
+
         Ok(removal_stats)
     }
 
@@ -325,12 +346,15 @@ impl<'a> CleanupTask<'a> {
                     .contains(uuid.as_ref())
                 {
                     return Ok(None);
-                } else if !maybe_in_progress
-                    || inspection
-                        .verified_files
-                        .index_uuids
-                        .contains(uuid.as_ref())
+                } else if !maybe_in_progress {
+                    info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE_UNVERIFIED, type=AUDIT_TYPE_INDEX, path = path.to_string());
+                    return Ok(Some(path));
+                } else if inspection
+                    .verified_files
+                    .index_uuids
+                    .contains(uuid.as_ref())
                 {
+                    info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE, type=AUDIT_TYPE_INDEX, path = path.to_string());
                     return Ok(Some(path));
                 }
             } else {
@@ -346,12 +370,15 @@ impl<'a> CleanupTask<'a> {
                         .contains(&relative_path)
                     {
                         Ok(None)
-                    } else if !maybe_in_progress
-                        || inspection
-                            .verified_files
-                            .data_paths
-                            .contains(&relative_path)
+                    } else if !maybe_in_progress {
+                        info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE_UNVERIFIED, type=AUDIT_TYPE_DATA, path = path.to_string());
+                        Ok(Some(path))
+                    } else if inspection
+                        .verified_files
+                        .data_paths
+                        .contains(&relative_path)
                     {
+                        info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE, type=AUDIT_TYPE_DATA, path = path.to_string());
                         Ok(Some(path))
                     } else {
                         Ok(None)
@@ -373,12 +400,15 @@ impl<'a> CleanupTask<'a> {
                         .contains(&relative_path)
                     {
                         Ok(None)
-                    } else if !maybe_in_progress
-                        || inspection
-                            .verified_files
-                            .delete_paths
-                            .contains(&relative_path)
+                    } else if !maybe_in_progress {
+                        info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE_UNVERIFIED, type=AUDIT_TYPE_DELETION, path = path.to_string());
+                        Ok(Some(path))
+                    } else if inspection
+                        .verified_files
+                        .delete_paths
+                        .contains(&relative_path)
                     {
+                        info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE, type=AUDIT_TYPE_DELETION, path = path.to_string());
                         Ok(Some(path))
                     } else {
                         Ok(None)
@@ -476,7 +506,7 @@ mod tests {
     use lance_linalg::distance::MetricType;
     use lance_table::io::commit::RenameCommitHandler;
     use lance_testing::datagen::{some_batch, BatchGenerator, IncrementingInt32};
-    use snafu::{location, Location};
+    use snafu::location;
 
     use crate::{
         dataset::{builder::DatasetBuilder, ReadParams, WriteMode, WriteParams},
@@ -556,7 +586,7 @@ mod tests {
         pub clock: MockClock<'a>,
     }
 
-    impl<'a> MockDatasetFixture<'a> {
+    impl MockDatasetFixture<'_> {
         fn try_new() -> Result<Self> {
             let tmpdir = tempdir()?;
             // let tmpdir_uri = to_obj_store_uri(tmpdir.path())?;
@@ -1023,7 +1053,7 @@ mod tests {
 
         let before_count = fixture.count_files().await.unwrap();
         // we store 2 files (index and quantized storage) for each index
-        assert_eq!(before_count.num_index_files, 1);
+        assert_eq!(before_count.num_index_files, 2);
         // Two user data files
         assert_eq!(before_count.num_data_files, 2);
         // Creating an index creates a new manifest so there are 3 total

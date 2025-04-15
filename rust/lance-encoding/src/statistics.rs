@@ -7,14 +7,14 @@ use std::{
     sync::Arc,
 };
 
-use arrow::array::AsArray;
+use arrow::{array::AsArray, datatypes::UInt64Type};
 use arrow_array::{Array, ArrowPrimitiveType, UInt64Array};
 use hyperloglogplus::{HyperLogLog, HyperLogLogPlus};
 use num_traits::PrimInt;
 
 use crate::data::{
-    AllNullDataBlock, DataBlock, DictionaryDataBlock, FixedWidthDataBlock, NullableDataBlock,
-    OpaqueBlock, StructDataBlock, VariableWidthBlock,
+    AllNullDataBlock, DataBlock, DictionaryDataBlock, FixedSizeListBlock, FixedWidthDataBlock,
+    NullableDataBlock, OpaqueBlock, StructDataBlock, VariableWidthBlock,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -58,10 +58,10 @@ impl ComputeStat for DataBlock {
             Self::AllNull(_) => {}
             Self::Nullable(data_block) => data_block.data.compute_stat(),
             Self::FixedWidth(data_block) => data_block.compute_stat(),
-            Self::FixedSizeList(_) => {}
+            Self::FixedSizeList(data_block) => data_block.compute_stat(),
             Self::VariableWidth(data_block) => data_block.compute_stat(),
             Self::Opaque(data_block) => data_block.compute_stat(),
-            Self::Struct(_) => {}
+            Self::Struct(data_block) => data_block.compute_stat(),
             Self::Dictionary(_) => {}
         }
     }
@@ -112,8 +112,19 @@ impl ComputeStat for FixedWidthDataBlock {
         if let Some(cardinality_array) = cardidinality_array {
             info.insert(Stat::Cardinality, cardinality_array);
         }
+    }
+}
 
-        // TODO(broccoliSpicy): We also need to consider FixedSizeList here
+impl ComputeStat for FixedSizeListBlock {
+    fn compute_stat(&mut self) {
+        // We leave the child stats unchanged.  This may seem odd (e.g. should bit width be the
+        // bit width of the child * dimension?) but it's because we use these stats to determine
+        // compression and we are currently just compressing the child data.
+        //
+        // There is a potential opportunity here to do better.  For example, if we have a FSL of
+        // 4 32-bit integers then we should probably treat them as a single 128-bit integer or maybe
+        // even 4 columns of 32-bit integers.  This might yield better compression.
+        self.child.compute_stat();
     }
 }
 
@@ -156,7 +167,7 @@ impl GetStat for DataBlock {
             Self::AllNull(data_block) => data_block.get_stat(stat),
             Self::Nullable(data_block) => data_block.get_stat(stat),
             Self::FixedWidth(data_block) => data_block.get_stat(stat),
-            Self::FixedSizeList(_) => None,
+            Self::FixedSizeList(data_block) => data_block.get_stat(stat),
             Self::VariableWidth(data_block) => data_block.get_stat(stat),
             Self::Opaque(data_block) => data_block.get_stat(stat),
             Self::Struct(data_block) => data_block.get_stat(stat),
@@ -182,6 +193,21 @@ impl GetStat for VariableWidthBlock {
             panic!("get_stat should be called after statistics are computed.");
         }
         block_info.get(&stat).cloned()
+    }
+}
+
+impl GetStat for FixedSizeListBlock {
+    fn get_stat(&self, stat: Stat) -> Option<Arc<dyn Array>> {
+        let child_stat = self.child.get_stat(stat);
+        match stat {
+            Stat::MaxLength => child_stat.map(|max_length| {
+                // this is conservative when working with variable length data as we shouldn't assume
+                // that we have a list of all max-length elements but it's cheap and easy to calculate
+                let max_length = max_length.as_primitive::<UInt64Type>().value(0);
+                Arc::new(UInt64Array::from(vec![max_length * self.dimension])) as Arc<dyn Array>
+            }),
+            _ => child_stat,
+        }
     }
 }
 
@@ -371,8 +397,30 @@ impl GetStat for DictionaryDataBlock {
 }
 
 impl GetStat for StructDataBlock {
-    fn get_stat(&self, _stat: Stat) -> Option<Arc<dyn Array>> {
-        None
+    fn get_stat(&self, stat: Stat) -> Option<Arc<dyn Array>> {
+        let block_info = self.block_info.0.read().unwrap();
+        if block_info.is_empty() {
+            panic!("get_stat should be called after statistics are computed.")
+        }
+        block_info.get(&stat).cloned()
+    }
+}
+
+impl ComputeStat for StructDataBlock {
+    fn compute_stat(&mut self) {
+        let data_size = self.data_size();
+        let data_size_array = Arc::new(UInt64Array::from(vec![data_size]));
+
+        let max_len = self
+            .children
+            .iter()
+            .map(|child| child.expect_single_stat::<UInt64Type>(Stat::MaxLength))
+            .sum::<u64>();
+        let max_len_array = Arc::new(UInt64Array::from(vec![max_len]));
+
+        let mut info = self.block_info.0.write().unwrap();
+        info.insert(Stat::DataSize, data_size_array);
+        info.insert(Stat::MaxLength, max_len_array);
     }
 }
 
@@ -394,6 +442,7 @@ mod tests {
     use super::DataBlock;
 
     use arrow::{
+        array::AsArray,
         compute::concat,
         datatypes::{Int32Type, UInt64Type},
     };
@@ -442,18 +491,25 @@ mod tests {
         let fields = vec![
             Arc::new(Field::new("int_field", DataType::Int32, false)),
             Arc::new(Field::new("float_field", DataType::Float32, false)),
-            Arc::new(Field::new(
-                "fsl_field",
-                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Int32, true)), 5),
-                false,
-            )),
         ]
         .into();
 
         let mut gen = lance_datagen::array::rand_type(&DataType::Struct(fields));
         let arr = gen.generate(RowCount::from(3), &mut rng).unwrap();
         let block = DataBlock::from_array(arr.clone());
-        assert!(block.get_stat(Stat::DataSize).is_none());
+        let (_, arr_parts, _) = arr.as_struct().clone().into_parts();
+        let total_buffer_size: usize = arr_parts
+            .iter()
+            .map(|arr| {
+                arr.to_data()
+                    .buffers()
+                    .iter()
+                    .map(|buffer| buffer.len())
+                    .sum::<usize>()
+            })
+            .sum();
+        let data_size = block.expect_single_stat::<UInt64Type>(Stat::DataSize);
+        assert!(data_size == total_buffer_size as u64);
 
         // test DataType::Dictionary
         let mut gen = array::rand_type(&DataType::Dictionary(

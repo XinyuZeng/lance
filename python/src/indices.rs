@@ -138,6 +138,7 @@ fn train_pq_model(
         centroids: Some(ivf_centroids),
         offsets: vec![],
         lengths: vec![],
+        loss: None,
     };
     let codebook = RT.block_on(
         Some(py),
@@ -167,7 +168,7 @@ async fn do_transform_vectors(
     partitions_ds_uri: Option<&str>,
 ) -> PyResult<()> {
     let num_rows = dataset.ds.count_rows(None).await.infer_error()?;
-    let fragments = fragments.iter().map(|item| item.metadata().inner).collect();
+    let fragments = fragments.iter().map(|item| item.metadata().0).collect();
     let transform_input = dataset
         .ds
         .scan()
@@ -287,10 +288,7 @@ pub fn shuffle_transformed_vectors(
     )?;
 
     match result {
-        Ok(partition_files) => {
-            let py_list = PyList::new_bound(py, partition_files);
-            Ok(py_list.into())
-        }
+        Ok(partition_files) => PyList::new(py, partition_files).map(|py_list| py_list.into()),
         Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(e.to_string())),
     }
 }
@@ -357,6 +355,7 @@ pub fn load_shuffled_vectors(
         centroids: Some(ivf_centroids),
         offsets: vec![],
         lengths: vec![],
+        loss: None,
     };
 
     let codebook = pq_codebook.0;
@@ -380,7 +379,7 @@ pub fn load_shuffled_vectors(
 }
 
 pub fn register_indices(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
-    let indices = PyModule::new_bound(py, "indices")?;
+    let indices = PyModule::new(py, "indices")?;
     indices.add_wrapped(wrap_pyfunction!(train_ivf_model))?;
     indices.add_wrapped(wrap_pyfunction!(train_pq_model))?;
     indices.add_wrapped(wrap_pyfunction!(transform_vectors))?;

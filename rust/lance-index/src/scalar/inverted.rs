@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-mod builder;
+pub mod builder;
 mod index;
+pub mod query;
 mod tokenizer;
 mod wand;
 

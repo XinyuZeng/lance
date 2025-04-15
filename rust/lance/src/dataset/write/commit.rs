@@ -9,7 +9,7 @@ use lance_table::{
     format::{is_detached_version, DataStorageFormat},
     io::commit::{CommitConfig, CommitHandler, ManifestNamingScheme},
 };
-use snafu::{location, Location};
+use snafu::location;
 
 use crate::{
     dataset::{
@@ -273,7 +273,7 @@ impl<'a> CommitBuilder<'a> {
             ..Default::default()
         };
 
-        let (manifest, manifest_file) = if let Some(dataset) = dest.dataset() {
+        let (manifest, manifest_file, manifest_e_tag) = if let Some(dataset) = dest.dataset() {
             if self.detached {
                 if matches!(manifest_naming_scheme, ManifestNamingScheme::V1) {
                     return Err(Error::NotSupported {
@@ -332,6 +332,7 @@ impl<'a> CommitBuilder<'a> {
                 manifest: Arc::new(manifest),
                 manifest_file,
                 session,
+                manifest_e_tag,
                 ..dataset.as_ref().clone()
             }),
             WriteDestination::Uri(uri) => Ok(Dataset {
@@ -344,6 +345,7 @@ impl<'a> CommitBuilder<'a> {
                 commit_handler,
                 tags,
                 manifest_naming_scheme,
+                manifest_e_tag,
             }),
         }
     }
@@ -423,7 +425,7 @@ mod tests {
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use lance_table::{
         format::{DataFile, Fragment},
-        io::commit::RenameCommitHandler,
+        io::commit::ConditionalPutCommitHandler,
     };
     use url::Url;
 
@@ -485,7 +487,7 @@ mod tests {
         let dataset = InsertBuilder::new("memory://test")
             .with_params(&WriteParams {
                 store_params: Some(store_params.clone()),
-                commit_handler: Some(Arc::new(RenameCommitHandler)),
+                commit_handler: Some(Arc::new(ConditionalPutCommitHandler)),
                 ..Default::default()
             })
             .execute(vec![batch])
@@ -523,17 +525,16 @@ mod tests {
             // resolution.
             let (reads, writes) = get_new_iops();
             assert_eq!(reads, 1, "i = {}", i);
-            // Should see 3 IOPs:
+            // Should see 2 IOPs:
             // 1. Write the transaction files
-            // 2. Write the manifest
-            // 3. Atomically rename the manifest
-            assert_eq!(writes, 3, "i = {}", i);
+            // 2. Write (conditional put) the manifest
+            assert_eq!(writes, 2, "i = {}", i);
         }
 
         // Commit transaction with URI and session
         let new_ds = CommitBuilder::new("memory://test")
             .with_store_params(store_params.clone())
-            .with_commit_handler(Arc::new(RenameCommitHandler))
+            .with_commit_handler(Arc::new(ConditionalPutCommitHandler))
             .with_session(dataset.session.clone())
             .execute(sample_transaction(1))
             .await
@@ -544,12 +545,12 @@ mod tests {
         // are needed.
         let (reads, writes) = get_new_iops();
         assert_eq!(reads, 3);
-        assert_eq!(writes, 3);
+        assert_eq!(writes, 2);
 
         // Commit transaction with URI and no session
         let new_ds = CommitBuilder::new("memory://test")
             .with_store_params(store_params)
-            .with_commit_handler(Arc::new(RenameCommitHandler))
+            .with_commit_handler(Arc::new(ConditionalPutCommitHandler))
             .execute(sample_transaction(1))
             .await
             .unwrap();
@@ -557,7 +558,7 @@ mod tests {
         // Now we have to load all previous transactions.
         let (reads, writes) = get_new_iops();
         assert!(reads > 20);
-        assert_eq!(writes, 3);
+        assert_eq!(writes, 2);
     }
 
     #[tokio::test]
