@@ -2540,6 +2540,9 @@ impl PrimitiveStructuralEncoder {
 }
 
 impl FieldEncoder for PrimitiveStructuralEncoder {
+    fn current_bytes(&self) -> u64 {
+        self.accumulation_queue.current_bytes()
+    }
     // Buffers data, if there is enough to write a page then we create an encode task
     fn maybe_encode(
         &mut self,
