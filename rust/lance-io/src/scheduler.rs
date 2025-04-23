@@ -607,6 +607,7 @@ impl ScanScheduler {
             let dest = dest.clone();
             let io_queue = self.io_queue.clone();
             let num_bytes = iop.end - iop.start;
+            // println!("iop: {:?}, size: {}", iop, num_bytes);
             let task = IoTask {
                 reader: reader.clone(),
                 to_read: iop,
